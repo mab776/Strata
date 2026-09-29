@@ -19,6 +19,7 @@
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/kernels/cvec.hpp"
+#include "strata/kernels/ablate.hpp"
 #include "strata/kernels/gr.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/kv_q8.hpp"
@@ -684,7 +685,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     const int tb_[2] = {0, (T + 1) / 2}, te_[2] = {G == 2 ? (T + 1) / 2 : T, T};
     // S26 STRATA_LFUSE=1: where the shared expert's gate / scale fusions apply (the paths they replace are the ones taken)
     auto lfuse_on = [&](int n) {
-        return g_lfuse() && ar_on() && native_moe_combine_enabled() && dec_batch && n > 1 && n <= 8 &&
+        return !strata::kernels::ablate_loaded() && g_lfuse() && ar_on() && native_moe_combine_enabled() && dec_batch && n > 1 && n <= 8 &&
                shared_expert_native_bf16_enabled();
     };
     bool sg_gated_[2] = {false, false};   // per group: the combine applies the shared gate
@@ -1002,6 +1003,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 if (!g_qfuse() || batch_rec_) native_quantize_q8_1(y_ + (size_t) tb * ZV, xq_, (int) ZV, n, cs);
                 il_ready = false;
                 mm(wout, bo_ + tb * N, (int) ZV, (int) N);
+                ablate_mixer(bo_ + tb * N, N, nullptr, 0, l, n, cs);   // --ablate
             } else {
                 // ======================= QSA =======================
                 const int64_t qi = qsa_idx[(size_t) l];
@@ -1229,6 +1231,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 native_quantize_q8_1(attn32_ + tb * NH * HD, xq_, (int) (NH * HD), n, cs);
                 il_ready = false;
                 mm(wo, bo_ + tb * N, (int) (NH * HD), (int) N);
+                ablate_mixer(bo_ + tb * N, N, attn32_ + tb * NH * HD, NH * HD, l, n, cs);   // --ablate
             }
         } catch (const std::exception& e) {
             err = "verify layer " + std::to_string(l) + ": " + e.what();
@@ -1342,6 +1345,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                     qdedup ? (const void*) (nat_xq_ + (size_t) tb * (N / 32) * 36) : nullptr,
                                     (sg_ready ? 1 : 0) | (lfuse_on(n) && g_lfuse_pair() ? 2 : 0));
                 sg_gated_[grp] = sg_ready;
+                // --ablate: a shexp LoRA (shared_ is gated; sh_gate_ holds the SwiGLU intermediate). On sh_stream: it
+                // edits shared_ in place from read-only tables, before ev_join (mab776, 0.1.39 #646 forked this stream)
+                ablate_shared(shared_ + tb * N, N, sh_gate_ + (size_t) tb * g.n_ff, g.n_ff, sh_g_ + tb, l, n, sh_stream);
             } catch (const std::exception& e) {
                 err = std::string("verify shared expert: ") + e.what();
                 return false;
@@ -1461,6 +1467,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         }
         if (remote_opt_) remote_opt_->combine(bo_ + tb * N, y_dummy_ + tb * N, tb, n,
                               device_plan_ ? skip_ + grp : nullptr, ring, cs);
+        try { ablate_project(bo_ + tb * N, N, l, n, cs); }   // --ablate: the combined FFN output (after any remote combine)
+        catch (const std::exception& e) { err = "verify ablate: " + std::string(e.what()); return false; }
         stamp(l, 24, grp);
         if (l == g.n_layers - 1) {
             if (!fuse_head_gr) {

@@ -64,6 +64,7 @@
 #include "strata/spec/draft_source.hpp"
 #include "strata/spec/suffix_drafter.hpp"
 #include "strata/kernels/cvec.hpp"
+#include "strata/kernels/ablate.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/core/device.hpp"
 #include "strata/core/emulate.hpp"
@@ -639,6 +640,11 @@ struct Options {
     int cvec_first = -1, cvec_last = -1;   ///< llama.cpp's defaults: 1 .. the last layer
     int cvec_mode = 1;                     ///< 0 = project, 1 = add (llama.cpp's default)
     int cvec_single = -1;                  ///< --cvec-dir single:L (project mode): layer L's direction everywhere
+    /// Directional ablation (strata/kernels/ablate.hpp): the llama.cpp `replayfix-ablate` patch.  --ablate FILE = a
+    /// control-vector GGUF whose direction.<l> hold the ONE global direction; --ablate-lora FILE = the residual LoRA
+    /// for the weights the projection cannot express.  Switched per request with the control vector's cvec=0|1.
+    std::string ablate_file, ablate_lora_file;
+    float ablate_strength = 1.5f;
 };
 
 void usage() {
@@ -773,6 +779,10 @@ void usage() {
                  "  --control-vector-layer-range A B  the layers it follows (inclusive; default 1 .. the last)\n"
                  "  --cvec-mode add|project  h += s v (default) or h -= s (h.v) v with v unit\n"
                  "  --cvec-dir per-layer|single:L  each layer's own direction (default) or layer L's everywhere (project)\n"
+                 "  --ablate FILE        directional ablation: y -= s d (d.y) on every mixer / FFN output and the PLE value\n"
+                 "                       (FILE = control-vector GGUF holding the one global d).  --serve: cvec=0|1 switches it\n"
+                 "  --ablate-strength S  s (default 1.5)\n"
+                 "  --ablate-lora FILE   residual LoRA for the weights a rank-1 projection cannot express (llama.cpp format)\n"
                  "  --no-token-graph     A/B: two graphs per layer (the host launches each) instead of one per token\n"
                  "  --no-fused-gr        A/B: the six-kernel hyper-connection read and a separate write (native)\n"
                  "  --prefill CHUNK      batched prompt processing in chunks of CHUNK tokens (needs --native); auto =\n"
@@ -1348,7 +1358,95 @@ bool checkpoint_restore(const ConvCheckpoint& c, strata::core::SessionState& ss,
 
 // --control-vector-scaled: llama.cpp's `common_control_vector_load` (every file's `direction.<l>` times its scale,
 // summed; layer 0 has none) and `llama_adapter_cvec::apply` with the projection-mode patch (project: the unit
-// direction and its norm as the scale), into the tables `cvec_upload` takes.  `summary` is what INFO reports;
+// direction and its norm as the scale), into the tables `cvec_upload` takes.  `summary` is what INFO reports.
+// --ablate: the global direction (every direction.<l> of the file must be the same vector - apetersson's adapter has
+// one) and the residual LoRA.  A LoRA whose B lies along d is the projection itself (layer 0's in the residual file:
+// llama.cpp's control-vector storage has no layer-0 slot) - the projection serves it, on this model's own weights.
+// ffn_down_exps LoRAs must be of that kind (the routed sum is projected).  Everything else loads as a LoRA.
+bool load_ablation(const Options& o, const strata::core::ModelGeometry& g, std::string& summary, std::string& err) {
+    const int64_t L = g.n_layers, N = g.n_embd;
+    std::vector<float> d;
+    try {
+        strata::GgufFile f(o.ablate_file);
+        for (const strata::TensorInfo& t : f.tensors()) {
+            if (t.name.rfind("direction.", 0) != 0) continue;
+            if (t.type != 0 || t.elements() != (uint64_t) N) { err = o.ablate_file + ": " + t.name + " must be f32[n_embd]"; return false; }
+            const float* src = reinterpret_cast<const float*>(f.tensor_data(t));
+            if (d.empty()) { d.assign(src, src + N); continue; }
+            for (int64_t j = 0; j < N; ++j)
+                if (std::fabs(src[j] - d[(size_t) j]) > 1e-6f) {
+                    err = o.ablate_file + ": " + t.name + " differs from the first direction; --ablate takes ONE global d";
+                    return false;
+                }
+        }
+    } catch (const std::exception& e) { err = e.what(); return false; }
+    if (d.empty()) { err = o.ablate_file + ": no direction.<layer> tensors"; return false; }
+    double nrm = 0.0;
+    for (float v : d) nrm += (double) v * v;
+    nrm = std::sqrt(nrm);
+    std::vector<strata::kernels::AblateLora> loras;
+    int as_projection = 0;
+    if (!o.ablate_lora_file.empty()) {
+        try {
+            strata::GgufFile f(o.ablate_lora_file);
+            std::map<std::string, const strata::TensorInfo*> by_name;
+            for (const strata::TensorInfo& t : f.tensors()) by_name[t.name] = &t;
+            for (const auto& [name, ta] : by_name) {
+                const std::string suf = ".weight.lora_a";
+                if (name.size() <= suf.size() || name.compare(name.size() - suf.size(), suf.size(), suf) != 0) continue;
+                const std::string base = name.substr(0, name.size() - suf.size());   // blk.L.<weight>
+                auto it = by_name.find(base + ".weight.lora_b");
+                if (it == by_name.end()) { err = o.ablate_lora_file + ": " + base + " has no lora_b"; return false; }
+                const strata::TensorInfo* tb = it->second;
+                int layer = -1;
+                char wname[64] = {0};
+                if (std::sscanf(base.c_str(), "blk.%d.%63s", &layer, wname) != 2 || layer < 0 || layer >= L) {
+                    err = o.ablate_lora_file + ": cannot place " + base; return false;
+                }
+                const std::string w = wname;
+                if (ta->type != 0 || tb->type != 0) { err = o.ablate_lora_file + ": " + base + " must be f32"; return false; }
+                const bool exps = w == "ffn_down_exps";
+                const uint64_t rank = ta->shape.size() >= 2 ? ta->shape[1] : 0, n_in = ta->shape[0];
+                if (!exps && (ta->shape.size() != 2 || tb->shape.size() != 2 || tb->shape[0] != rank || tb->shape[1] != (uint64_t) N)) {
+                    err = o.ablate_lora_file + ": " + base + " has unexpected shapes"; return false;
+                }
+                // B along d?  (every column; for the experts every expert's)
+                const float* B = reinterpret_cast<const float*>(f.tensor_data(*tb));
+                const uint64_t cols = tb->elements() / (uint64_t) N;   // ne = [rank, N(, experts)]
+                const uint64_t rk = tb->shape[0];
+                bool along = true;
+                for (uint64_t c = 0; c < cols && along; ++c) {
+                    const uint64_t e = c / rk, r = c % rk;
+                    const float* col = B + e * rk * (uint64_t) N;
+                    double dot = 0.0, n2 = 0.0;
+                    for (int64_t j = 0; j < N; ++j) { const double v = col[(uint64_t) j * rk + r]; dot += v * d[(size_t) j] / nrm; n2 += v * v; }
+                    if (n2 > 0.0 && n2 - dot * dot > 1e-8 * n2) along = false;
+                }
+                if (along) { ++as_projection; continue; }
+                if (exps) { err = o.ablate_lora_file + ": " + base + " is not along d (the routed experts can only be projected)"; return false; }
+                strata::kernels::AblateLora l;
+                l.layer = layer;
+                if (w == "attn_output" || w == "ssm_out") l.kind = 0;
+                else if (w == "ffn_down_shexp") l.kind = 1;
+                else { err = o.ablate_lora_file + ": " + base + ": only attn_output / ssm_out / ffn_down_shexp LoRAs"; return false; }
+                l.rank = (int) rank;
+                l.n_in = (int64_t) n_in;
+                const float* A = reinterpret_cast<const float*>(f.tensor_data(*ta));
+                l.a.assign(A, A + rank * n_in);
+                l.b.assign(B, B + (uint64_t) N * rank);
+                loras.push_back(std::move(l));
+            }
+        } catch (const std::exception& e) { err = e.what(); return false; }
+    }
+    if (!strata::kernels::ablate_upload(d, o.ablate_strength, N, L, loras, err)) return false;
+    char buf[96];
+    std::snprintf(buf, sizeof buf, "ablate:%.2f+%zulora", o.ablate_strength, loras.size());
+    summary = buf;
+    std::fprintf(stderr, "strata generate: ablation s=%.3f on layers 0..%lld (+ PLE value), %zu LoRA(s), %d rank-1 "
+                         "LoRA(s) served by the projection\n", o.ablate_strength, (long long) (L - 1), loras.size(), as_projection);
+    return true;
+}
+
 // `digest` identifies the uploaded tables, mode and range exactly (a session file is bound to it).
 bool load_control_vectors(const Options& o, const strata::core::ModelGeometry& g, std::string& summary,
                           uint64_t& digest, std::string& err) {
@@ -1794,6 +1892,9 @@ int main(int argc, char** argv) {
         }
         else if (a == "--mtp-draft-vocab") o.mtp_draft_vocab = next("--mtp-draft-vocab");
         else if (a == "--control-vector") o.cvec_files.push_back({next("--control-vector"), 1.0f});
+        else if (a == "--ablate") o.ablate_file = next("--ablate");
+        else if (a == "--ablate-lora") o.ablate_lora_file = next("--ablate-lora");
+        else if (a == "--ablate-strength") o.ablate_strength = std::strtof(next("--ablate-strength"), nullptr);
         else if (a == "--control-vector-scaled") {
             // FILE:SCALE, comma-separated; the LAST colon splits, so a Windows path (C:\...) keeps its drive
             std::stringstream list(next("--control-vector-scaled"));
@@ -2699,6 +2800,14 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
+    if (!o.ablate_file.empty()) {
+        std::string ce, as;
+        if (!load_ablation(o, g, as, ce)) {
+            std::fprintf(stderr, "strata generate: --ablate: %s\n", ce.c_str());
+            return 2;
+        }
+        cvec_summary = cvec_summary == "0" ? as : cvec_summary + "," + as;   // INFO cvec != 0: the server switches it
+    }
     if (o.max_context < (int64_t) o.tokens.size() + o.max_new) {
         std::fprintf(stderr, "strata generate: --max-context %lld cannot hold %zu prompt + %lld new tokens\n",
                      (long long) o.max_context, o.tokens.size(), (long long) o.max_new);
@@ -3016,7 +3125,7 @@ int main(int argc, char** argv) {
             return 1;
         }
         // a control vector (the speed projection): its tables on this device too - the stage's layers apply it here
-        if (!strata::kernels::cvec_replicate(err)) {
+        if (!strata::kernels::cvec_replicate(err) || !strata::kernels::ablate_replicate(err)) {
             std::fprintf(stderr, "strata generate: layer split, CUDA%d: %s\n", st.dev, err.c_str());
             return 1;
         }
@@ -8859,7 +8968,8 @@ int main(int argc, char** argv) {
                     if ((int32_t) ids[(size_t) i] != pre[(size_t) i]) return false;
                 return imgs_below(req_imgs, L) == pre_imgs;
             };
-            const bool want_cvec = strata::kernels::cvec().loaded() ? req_cvec != 0 : true;
+            // mab776: --ablate rides on the same per-request switch (the cvec key) as the control vector
+            const bool want_cvec = (strata::kernels::cvec().loaded() || strata::kernels::ablate_loaded()) ? req_cvec != 0 : true;
             // the last request's final commit may still be running on the verifier's stream (set_commit_async):
             // everything below reads, restores or zeroes the session from other streams and the host (the end of the
             // last request waited already; this covers a request that ended on an error path)
@@ -9057,6 +9167,7 @@ int main(int argc, char** argv) {
                 cvec_cached = want_cvec;
             }
             if (strata::kernels::cvec().loaded()) strata::kernels::cvec_set_enabled(want_cvec);
+            if (strata::kernels::ablate_loaded()) strata::kernels::ablate_set_enabled(want_cvec);
             // this request rewrites every cell from `resume` on, so a checkpoint past it (or not on this prompt's
             // path) no longer has its cells; the ones kept are prefixes of both the old tokens and the new
             checks.erase(std::remove_if(checks.begin(), checks.end(), [&](const ConvCheckpoint& c) {
