@@ -26,6 +26,7 @@
 #include "strata/kernels/s2_gemv_q8.hpp"
 #include "strata/kernels/s_gemv.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/ablate.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -232,7 +233,8 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
     }
     const int n = (int) (n_ff * n_tok);
     if (fused_swiglu_q81_enabled()) {
-        native_swiglu_quantize_q8_1(gate, up, nw.q8_1, (int) n_ff, n_tok, stream);
+        native_swiglu_quantize_q8_1(gate, up, nw.q8_1, (int) n_ff, n_tok, stream,
+                                    ablate_loaded() ? gate : nullptr);   // mab776: --ablate reads the SwiGLU intermediate in gate
     } else {
         native_swiglu_kernel<<<(unsigned) ((n + THREADS - 1) / THREADS), THREADS, 0, cs>>>(gate, up, gate, n);
         native_quantize_q8_1(gate, nw.q8_1, (int) n_ff, n_tok, stream);
@@ -272,6 +274,13 @@ uint64_t shared_expert_scratch_bytes(int64_t n_ff) {
     const uint64_t q0 = ((uint64_t) (n_ff / 32) * 34 + 15) & ~15ull;
     const uint64_t qk = ((uint64_t) (n_ff / 256) * 292 + 15) & ~15ull;
     return a * 2 + q0 + qk + 32;
+}
+
+const float* shared_expert_scratch_gate(const float* scratch, int64_t n_ff) {
+    const uint64_t a = ((uint64_t) n_ff * 4 + 15) & ~15ull;
+    const uint64_t q0 = ((uint64_t) (n_ff / 32) * 34 + 15) & ~15ull;
+    const uint64_t qk = ((uint64_t) (n_ff / 256) * 292 + 15) & ~15ull;
+    return (const float*) ((const uint8_t*) scratch + a * 2 + q0 + qk);
 }
 
 void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* x_bf16, const SForm& gate_form,
@@ -342,7 +351,8 @@ void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* 
     else
         gemv(up_form, up_codes, up_scales, up_off, x_q8_0, x_q8k, up, n_embd, n_ff);
     if (native_projection && native_down && fused_swiglu_q81_enabled()) {
-        native_swiglu_quantize_q8_1(gate, up, native->q8_1, (int) n_ff, 1, stream);
+        native_swiglu_quantize_q8_1(gate, up, native->q8_1, (int) n_ff, 1, stream,
+                                    ablate_loaded() ? gate : nullptr);   // mab776: --ablate reads the SwiGLU intermediate in gate
         native_mmvq(native->down_type, native->down_data, native->q8_1, out, (int) n_ff, (int) n_embd, 1, stream);
     } else {
         if (native_projection)
