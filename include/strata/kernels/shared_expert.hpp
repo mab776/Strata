@@ -47,6 +47,9 @@ struct NativeSharedWeights {
 /// captured at all; and P2.T10 requires ZERO token-path allocations, which this was.  Neither is visible in a
 /// test that only checks the output, and the capture test found it in one run.
 uint64_t shared_expert_scratch_bytes(int64_t n_ff);
+/// Where `shared_expert` leaves its per-token scalar gate inside the caller's scratch (after the call: sigmoid(g)).
+/// The SwiGLU intermediate (n_ff f32, the down projection's input) is at the scratch's start.
+const float* shared_expert_scratch_gate(const float* scratch, int64_t n_ff);
 
 /// `x_q8_0` and `x_q8k` are the TWO QUANTIZED IMAGES of the same activation, and which one a projection uses is
 /// decided per weight by its `SForm::act_kind`.  There is no fp16 activation here any more.
