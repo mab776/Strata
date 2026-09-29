@@ -239,6 +239,13 @@ uint64_t shared_expert_scratch_bytes(int64_t n_ff) {
     return a * 2 + q0 + qk + 32;
 }
 
+const float* shared_expert_scratch_gate(const float* scratch, int64_t n_ff) {
+    const uint64_t a = ((uint64_t) n_ff * 4 + 15) & ~15ull;
+    const uint64_t q0 = ((uint64_t) (n_ff / 32) * 34 + 15) & ~15ull;
+    const uint64_t qk = ((uint64_t) (n_ff / 256) * 292 + 15) & ~15ull;
+    return (const float*) ((const uint8_t*) scratch + a * 2 + q0 + qk);
+}
+
 void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* x_bf16, const SForm& gate_form,
                    const uint8_t* gate_codes, const float* gate_scales, const float* gate_off,
                    const SForm& up_form, const uint8_t* up_codes, const float* up_scales, const float* up_off,

@@ -14,6 +14,7 @@
 // The opt-in native BF16 path replaces only ple_value with the pinned CUDA single-token BF16/F32 MMVF.
 // A separate opt-in native postops path follows the pinned CUDA arithmetic after both projections.
 #include "strata/kernels/ple.hpp"
+#include "strata/kernels/ablate.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/ngram.hpp"
@@ -327,6 +328,7 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
         bf16_gemv_kernel<<<(n_embd + THREADS - 1) / THREADS, THREADS, 0, st>>>(d_emb16, w.value_bf16, d_value,
                                                                               n_embd, n_embd);
     }
+    ablate_project(d_value, n_embd, 1, 1, stream);   // --ablate: the PLE block is layer 1's (a no-op unless loaded)
 
     const float* normalized_key = d_key;
     if (native_postops) {
