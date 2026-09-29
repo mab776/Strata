@@ -27,6 +27,7 @@
 #include "strata/kernels/native_flash_attn.hpp"
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/kernels/cvec.hpp"
+#include "strata/kernels/ablate.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/fused_gdn.hpp"
 #include "strata/kernels/qsa_select.hpp"
@@ -449,6 +450,14 @@ f32_to_bf16_bulk(x, b.x_bf16, g.n_embd, stream);
     } catch (const std::exception& error) {
         err = v.name("shared_expert") + ": " + error.what();
         return false;
+    }
+    // --ablate: layer 47's rank-33 ffn_down_shexp LoRA (b.shared is already gated; the scratch holds its input)
+    if (strata::kernels::ablate_has_shexp_lora(layer)) {
+        try {
+            strata::kernels::ablate_shared(b.shared, g.n_embd, b.sh_scratch, g.n_ff,
+                                           strata::kernels::shared_expert_scratch_gate(b.sh_scratch, g.n_ff), layer, 1,
+                                           stream);
+        } catch (const std::exception& error) { err = v.name("ablate_shared") + ": " + error.what(); return false; }
     }
     return true;
 }
@@ -1412,7 +1421,11 @@ st_begin(layer, 0, stream);
     }
     st_end(layer, 0, stream);    dump_half(bb, g, layer, bb.inject, 2 * g.n_embd, g.hc, stream);        }
     if (run1) {
-    st_begin(layer, 1, stream);    if (qsa) {        if (!qsa_layer(tables, g, layer, pos, pos_base, qst, qb, bb.mixed, bb.block_out, stream, err,                            bb.dump))            return false;    } else {        if (!gdn_layer(tables, g, layer, gb, bb.mixed, bb.block_out, stream, err)) return false;    }    st_end(layer, 1, stream);    dump_half(bb, g, layer, bb.block_out, 0, g.n_embd, stream);        }
+    st_begin(layer, 1, stream);    if (qsa) {        if (!qsa_layer(tables, g, layer, pos, pos_base, qst, qb, bb.mixed, bb.block_out, stream, err,                            bb.dump))            return false;    } else {        if (!gdn_layer(tables, g, layer, gb, bb.mixed, bb.block_out, stream, err)) return false;    }
+    try {   // --ablate: the mixer's output (a no-op unless loaded)
+        strata::kernels::ablate_mixer(bb.block_out, g.n_embd, qsa ? qb.attn32 : nullptr, g.n_head * g.head_dim, layer, 1,
+                                      stream);
+    } catch (const std::exception& error) { err = std::string("ablate mixer: ") + error.what(); return false; }    st_end(layer, 1, stream);    dump_half(bb, g, layer, bb.block_out, 0, g.n_embd, stream);        }
     if (run2) {
     st_begin(layer, 2, stream);    if (!fused) gr_write(R, bb.block_out, bb.inject, gs, R, stream);    st_end(layer, 2, stream);
 // ---- half 2, UP TO AND INCLUDING THE ROUTER.  `gr_read` leaves the normed activation in `bb.mixed` and
@@ -1478,6 +1491,9 @@ bool block_layer_post(const WeightTable& tables, const ModelGeometry& g, int64_t
 st_begin(layer, 5, stream);
     if (g_shared_early ? !moe_combine_parts(g, layer, k, mb, parts, bb.block_out, stream, err)
                        : !moe_finish(tables, g, layer, k, mb, bb.mixed, parts, bb.block_out, stream, err)) return false;
+    try {   // --ablate: the combined FFN output
+        strata::kernels::ablate_project(bb.block_out, g.n_embd, layer, 1, stream);
+    } catch (const std::exception& error) { err = std::string("ablate ffn: ") + error.what(); return false; }
     st_end(layer, 5, stream);    dump_half(bb, g, layer, bb.block_out, (uint64_t) g.n_embd, g.n_embd, stream);    dump_half(bb, g, layer, bb.inject, (uint64_t) 2 * g.n_embd + g.hc, g.hc, stream);    st_begin(layer, 6, stream);
     const bool steer = strata::kernels::cvec().covers(layer);   // --control-vector-scaled: after this write
     try {
