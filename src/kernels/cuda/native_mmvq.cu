@@ -167,9 +167,9 @@ __global__ void native_quantize_q8_1_kernel(const float* x_, Q81Block* y_, int n
 }
 
 __launch_bounds__(QUANT_THREADS, 1)
-__global__ void native_swiglu_quantize_q8_1_kernel(const float* __restrict__ gate,
+__global__ void native_swiglu_quantize_q8_1_kernel(const float* gate,
                                                    const float* __restrict__ up,
-                                                   Q81Block* __restrict__ y, int n_in) {
+                                                   Q81Block* __restrict__ y, int n_in, float* h_out) {
     const int i = int(blockIdx.x) * QUANT_THREADS + int(threadIdx.x);
     if (i >= n_in) return; // n_in is a multiple of 32: only whole warps return.
     const float gi = gate[i];
@@ -180,6 +180,7 @@ __global__ void native_swiglu_quantize_q8_1_kernel(const float* __restrict__ gat
     const int8_t q = q8_1_quant(xi, d, amax);
     y[i / Q8K].qs[i % Q8K] = q;
     if (i % Q8K == 0) y[i / Q8K].ds = q8_1_ds(d, sum);
+    if (h_out != nullptr) h_out[i] = xi;   // mab776 --ablate: the SwiGLU intermediate for the shexp LoRA (h_out may be gate)
 }
 
 // Exact pinned vec_dot_q5_K_q8_1_impl_vmmq expression and integer dot order.
@@ -2083,7 +2084,7 @@ void native_quantize_q8_1(const float* x, void* x_q8_1, int n_in, int ncols, voi
 }
 
 void native_swiglu_quantize_q8_1(const float* gate, const float* up, void* x_q8_1,
-                                 int n_in, int ncols, void* stream) {
+                                 int n_in, int ncols, void* stream, float* h_out) {
     validate_shape(n_in, ncols);
     validate_pointer(gate);
     validate_pointer(up);
@@ -2093,7 +2094,7 @@ void native_swiglu_quantize_q8_1(const float* gate, const float* up, void* x_q8_
     const unsigned blocks = unsigned((std::size_t(n_total) + QUANT_THREADS - 1) / QUANT_THREADS);
     native_swiglu_quantize_q8_1_kernel<<<blocks, QUANT_THREADS, 0,
                                          static_cast<cudaStream_t>(stream)>>>(
-        gate, up, static_cast<Q81Block*>(x_q8_1), n_total);
+        gate, up, static_cast<Q81Block*>(x_q8_1), n_total, h_out);
     launch_check();
 }
 
