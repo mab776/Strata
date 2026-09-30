@@ -371,6 +371,7 @@ class Event:
 THINK_END = "</think>"
 CALL_START = "<tool_call>"
 CALL_END = "</tool_call>"
+FUNC_START = "<function="
 
 
 PARAM_END = "</parameter>"
@@ -597,14 +598,45 @@ class OutputParser:
                     best = max(best, n)
         return best
 
+    def _call_in_reasoning(self) -> tuple[int, bool]:
+        """A tool call written INSIDE the thinking: the model sometimes skips </think> and goes straight to
+        `<tool_call>\n<function=...`, then ends its turn - the calls came out as reasoning text and the client got a
+        turn with no answer and no call (VS Code Copilot: "request error", then "no response was returned").
+        `<tool_call>` followed by `<function=` ends the reasoning there; a bare `<tool_call>` in prose does not.
+        Returns (index of `<tool_call>`, True) for a call, (index, False) while the tags are still arriving, or
+        (-1, False).  Only with tools: without them there is nothing to call."""
+        if not self.schemas:
+            return -1, False
+        start = 0
+        while True:
+            k = self.buf.find(CALL_START, start)
+            if k < 0:
+                return -1, False
+            rest = self.buf[k + len(CALL_START):].lstrip()
+            if rest.startswith(FUNC_START):
+                return k, True
+            if FUNC_START.startswith(rest):
+                return k, False
+            start = k + 1
+
     def feed(self, delta: str) -> list[Event]:
         self.buf += delta
         out: list[Event] = []
         while True:
             if self.state == "reasoning":
                 i = self.buf.find(THINK_END)
+                k, sure = self._call_in_reasoning()
+                if k >= 0 and (i < 0 or k < i):
+                    if k:
+                        out.append(Event("reasoning", self.buf[:k]))
+                    if not sure:                                # `<tool_call>` + part of `<function=`: wait
+                        self.buf = self.buf[k:]
+                        return out
+                    self.buf = self.buf[k + len(CALL_START):]
+                    self.state = "call"
+                    continue
                 if i < 0:
-                    keep = self._hold(self.buf, (THINK_END,))
+                    keep = self._hold(self.buf, (THINK_END, CALL_START) if self.schemas else (THINK_END,))
                     if len(self.buf) > keep:
                         out.append(Event("reasoning", self.buf[:len(self.buf) - keep]))
                         self.buf = self.buf[len(self.buf) - keep:]
