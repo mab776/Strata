@@ -2385,6 +2385,7 @@ class Service:
                  fit_max_tokens: bool = False):
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
         self.literals = literal_tags(getattr(tokenizer, "control_tokens", ()))   # texts that stay text inside a message
+        self.ablit_model = None   # mab776: a second model id that forces the engine's --ablate on (config key below)
         self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
         self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
         self.reasoning_close_retry = False            # #1053 (opt-in): close the thinking once when a reply ends inside it
@@ -2533,13 +2534,14 @@ class Service:
         self.aliases = names
 
     def model_names(self) -> list[str]:
-        return [self.model, *self.aliases]
+        return [self.model, *self.aliases] + ([self.ablit_model] if self.ablit_model else [])   # mab776: + the abliterated id
 
     def model_for(self, req) -> str:
         """The name to answer with: the request's own when it is the model's name or an alias (#297), else the model's.
         Other names are still served, as before."""
         asked = req.get("model") if isinstance(req, dict) else None
-        return asked if isinstance(asked, str) and asked in self.aliases else self.model
+        return asked if isinstance(asked, str) and (asked in self.aliases or (self.ablit_model and asked == self.ablit_model)) \
+            else self.model                               # mab776: the abliterated id answers under its own name
 
     def reported_ctx(self) -> int:
         """The context the endpoints report (/v1/status, /v1/models, /props, /health, /slots, /metrics): the engine's,
@@ -2742,6 +2744,14 @@ class Service:
             except OSError as e:
                 print(f"[strata] could not save the shared settings: {e}", flush=True)
         return self.shared
+
+    def with_model_alias(self, req: dict) -> dict:
+        """mab776: the abliterated id = the same engine with the refusal ablation forced on for this request
+        (whatever the shared setting says); the normal id follows the shared setting / the request's own field."""
+        if self.ablit_model and req.get("model") == self.ablit_model:
+            req = dict(req)
+            req["experimental_speed_projection"] = True
+        return req
 
     def with_shared(self, req: dict, api: str) -> dict:
         """The request with the shared thinking level and max tokens filled in where it has none of its own."""
@@ -4320,6 +4330,8 @@ def make_handler(svc: Service):
                     if svc.aliases:                       # #297: the aliases, and each one listed under its own id
                         model["aliases"] = list(svc.aliases)
                     data = [model, *({**model, "id": x, "alias_of": svc.model} for x in svc.aliases)]
+                    if svc.ablit_model:                   # mab776: + the abliterated id (the same model, ablation forced on)
+                        data.append({**model, "id": svc.ablit_model})
                     self._json(200, {"object": "list", "data": data if loaded else []})
             elif path == "/props":
                 if self._authorized():
@@ -4688,7 +4700,7 @@ def make_handler(svc: Service):
                 items.close()
 
         def _openai(self, req):
-            req = svc.with_shared(req, "openai")
+            req = svc.with_model_alias(svc.with_shared(req, "openai"))
             messages, tools, kw = openai_to_messages(req)
             self._no_local_images(messages)
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # as the Responses route: no tools are offered
@@ -4917,7 +4929,7 @@ def make_handler(svc: Service):
 
         def _anthropic(self, req):
             svc.load()
-            req = svc.with_shared(req, "anthropic")
+            req = svc.with_model_alias(svc.with_shared(req, "anthropic"))
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
             self._no_local_images(messages)
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # Anthropic's {"type": "none"}: no tools offered
@@ -5535,6 +5547,14 @@ def main() -> int:
         raise SystemExit("[strata] config \"reasoning_loop_recovery\" must be false, \"stop\" or \"recover\", "
                          f"not {recovery!r}")
     svc.reasoning_loop_recovery = recovery
+    # mab776: "abliterated_model_name" in the config = a second id for the same engine with --ablate forced on.
+    # Only served when the engine really has an ablation / control vector loaded (INFO cvec != 0).
+    if cfg.get("abliterated_model_name"):
+        if str((getattr(engine, "info", {}) or {}).get("cvec", 0)) not in ("0", "", "None"):
+            svc.ablit_model = cfg["abliterated_model_name"]
+            print(f"[strata] also serving {svc.ablit_model} (the refusal ablation forced on)", flush=True)
+        else:
+            print("[strata] abliterated_model_name ignored: the engine has no --ablate loaded", flush=True)
     svc.gpu_index = (gpu_list(cfg) or [0])[0]           # the Monitor reads the card the engine runs on (issue #51)
     svc.gpu_indices = gpu_list(cfg)                     # ... or every card of a layer split (issue #112)
     svc.backend = cfg.get("backend")                    # "hip": the AMD cards' readings come from sysfs (#301)
