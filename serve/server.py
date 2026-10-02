@@ -1626,6 +1626,8 @@ class Vision:
             args += ["--max-tokens", str(cfg["max_tokens"])]
         if cfg.get("min_tokens"):                       # #767: mtmd's image_min_tokens (a hand-edited key)
             args += ["--min-tokens", str(cfg["min_tokens"])]
+        if cfg.get("flash_attn"):                       # mab776: "off" = the vision tower's attention in FP32
+            args += ["--flash-attn", str(cfg["flash_attn"])]   # (FA keeps K/V in FP16: 7.6-11 % off on real images)
         self.dir = self.work_dir()
         self.spawn = (args, log, env)                   # to start it again after an unload
         self.stopped = False
