@@ -215,8 +215,20 @@ def _late_system_to_user(messages: list[dict]) -> list[dict]:
     """The chat template takes a system message only at the start ("System message must be at the beginning").
     Clients also send them mid-conversation - Claude Code's hook context as {"role": "system"} after the first user
     turn, some OpenAI clients a late "developer" message (issue #56) - so those become user messages, in place:
-    merging them into the first one would change the prompt's start and cost the conversation cache every turn."""
-    return [dict(m, role="user") if m.get("role") == "system" and i > 0 else m for i, m in enumerate(messages)]
+    merging them into the first one would change the prompt's start and cost the conversation cache every turn.
+    mab776 (#843): an assistant turn with neither text nor a tool call is dropped.  Once one sits in an agent's
+    history the model imitates it (closes its reasoning, ends the turn, no <tool_call>) and the agent stops."""
+    return [dict(m, role="user") if m.get("role") == "system" and i > 0 else m for i, m in enumerate(messages)
+            if not _empty_assistant(m)]
+
+
+def _empty_assistant(m: dict) -> bool:
+    if m.get("role") != "assistant" or m.get("tool_calls"):
+        return False
+    c = m.get("content")
+    if isinstance(c, list):
+        return not any(p.get("type") != "text" or p.get("text", "").strip() for p in c if isinstance(p, dict))
+    return not (c or "").strip()
 
 
 def _object_list(value, name: str) -> list[dict]:

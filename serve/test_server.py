@@ -740,6 +740,22 @@ class ClientShapes(unittest.TestCase):
         msgs, _, _ = anthropic_to_messages({"system": "S", "messages": [{"role": "user", "content": "u"}]})
         self.assertEqual([m["role"] for m in msgs], ["system", "user"])
 
+    def test_empty_assistant_turns_dropped(self):
+        # mab776 (#843): an assistant turn with no text and no tool call is left out of the prompt; one with a tool
+        # call (and empty content), or with text, stays
+        from serve.frontend import anthropic_to_messages, openai_to_messages
+        call = [{"type": "function", "function": {"name": "f", "arguments": "{}"}}]
+        msgs, _, _ = openai_to_messages({"messages": [
+            {"role": "user", "content": "a"}, {"role": "assistant", "content": "", "reasoning_content": "hmm"},
+            {"role": "user", "content": "b"}, {"role": "assistant", "content": None, "tool_calls": call},
+            {"role": "tool", "content": "r"}, {"role": "assistant", "content": [{"type": "text", "text": " \n"}]},
+            {"role": "user", "content": "c"}, {"role": "assistant", "content": "ok"}, {"role": "user", "content": "d"}]})
+        self.assertEqual([m["role"] for m in msgs], ["user", "user", "assistant", "tool", "user", "assistant", "user"])
+        msgs, _, _ = anthropic_to_messages({"messages": [
+            {"role": "user", "content": "a"}, {"role": "assistant", "content": [{"type": "text", "text": ""}]},
+            {"role": "user", "content": "b"}]})
+        self.assertEqual([m["role"] for m in msgs], ["user", "user"])
+
     def test_messages_sent_as_a_json_string(self):
         # #460: a client that double-encodes "messages" (and "tool_calls") as a JSON string gets them decoded; what is
         # still not a list of objects is a ValueError (the server's 400), not an AttributeError on m.get
