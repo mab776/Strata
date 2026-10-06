@@ -144,6 +144,9 @@ VISION_START = "<|vision_start|>"
 REPEAT_STOP_TOKENS = 256
 # #123: what closes the thinking when it reaches reasoning_budget_tokens (the model's own end-of-thinking tag after it)
 REASONING_WRAP_UP = "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n"
+# mab776 (#1053): a reply that stops while still thinking (no </think>, so no answer and no tool call) is closed
+# and continued once, the way #123 closes a thinking budget.  STRATA_STOP_IN_THINKING=0 turns it off.
+STOP_IN_THINKING_CLOSE = "\n</think>\n\n"
 # #728: opt-in handling of reasoning that repeats whole passages (which the single-token guard above cannot see).
 # "reasoning_loop_recovery": "stop" ends the reply there; "recover" (or true) goes on from the same output with the
 # low-effort instruction in place of the xhigh one.  Both off by default.
@@ -2945,6 +2948,7 @@ class Service:
                     before = getattr(self.engine, "last", None)
                     last_print = time.time()
                     prompt, thought = ids, 0            # thought: the reasoning tokens so far (the budget's count)
+                    stop_close = thinking and os.environ.get("STRATA_STOP_IN_THINKING", "1") != "0"   # #1053, once
                     for ev in opening:
                         yield "event", ev
                     while True:
@@ -2953,6 +2957,7 @@ class Service:
                         recover_prompt = None
                         seg, wrap, leaving = [], False, False   # this pass's tokens; the budget is reached; closed
                         opens = False                   # the thinking is over: write the forced call's opening
+                        resume = False                  # #1053: stopped while still thinking
                         try:
                             for t in gen:
                                 if t is None:               # heartbeat while the engine is quiet
@@ -2966,6 +2971,9 @@ class Service:
                                 if t in self.stop_ids:
                                     finish = "stop"
                                     raw_ids.append(t)
+                                    if stop_close and parser.state == "reasoning" and not parser.buf \
+                                            and not parser.pending and not detok.pending():
+                                        resume = True   # #1053: no </think> yet = no answer, no tool call
                                     break
                                 raw_ids.append(t)
                                 seg.append(t)
@@ -3053,6 +3061,24 @@ class Service:
                                   f"(coverage={repeat_coverage:.3f}); resuming the same output with the low-effort "
                                   "instruction (reasoning_loop_recovery)", flush=True)
                             continue
+                        if resume and not cancel.is_set():
+                            stop_close = False          # #1053: once per reply; a second stop ends it normally
+                            extra = self.tok.encode(STOP_IN_THINKING_CLOSE, parse_special=True)
+                            if max_new - n - len(extra) >= 1:
+                                print("[strata] the reply stopped inside its thinking (no answer, no tool call): "
+                                      "closing the thinking and letting it answer (#1053)", flush=True)
+                                raw_ids.pop()           # the stop token is not part of the continued prompt
+                                for t in extra:
+                                    n += 1
+                                    raw_ids.append(t)
+                                    thinking_n += parser.state in ("reasoning", "rcall")
+                                    evs = cut(parser.feed(detok.push(t)))
+                                    self._note(n, evs, st, rate)
+                                    for ev in evs:
+                                        yield "event", ev
+                                finish = "length"
+                                prompt = prompt + seg + extra
+                                continue
                         if not (wrap or opens) or cancel.is_set():
                             break
                         # #123: the thinking reached reasoning_budget_tokens.  Close it the way the model would (a

@@ -3967,5 +3967,76 @@ class ClaudeCodeBillingStamp(unittest.TestCase):
         self.assertEqual(ids[1][:len(first) - 8], first[:len(first) - 8])   # all but the generation header
 
 
+class StopInThinkingEngine(MockEngine):
+    """#1053: stops inside its thinking (no </think>, no call) unless the prompt already closed it; `stubborn` stops
+    inside the thinking every time.  Records every prompt."""
+    THOUGHT = "I need to investigate further."
+    ANSWER = "Done."
+
+    def __init__(self, tok, stubborn=False, normal=False):
+        super().__init__(tok, "x", max_context=CTX)
+        self.prompts, self.stubborn, self.normal = [], stubborn, normal
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        self.prompts.append(list(ids))
+        closed = self.tok.decode(ids).endswith("</think>\n\n")
+        if self.normal:
+            text = self.THOUGHT + "</think>\n\n" + self.ANSWER
+        else:
+            text = self.THOUGHT if (self.stubborn or not closed) else self.ANSWER
+        for t in (self.tok.encode(text) + self.tok.encode("<|im_end|>", parse_special=True))[:max_new]:
+            if cancel.is_set():
+                return
+            yield t
+
+
+class StopInThinking(unittest.TestCase):
+    """mab776 (#1053): a reply that ends inside its thinking is closed with </think> and continued once."""
+
+    def run_one(self, engine, env=None):
+        tok = engine.tok
+        svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        httpd = serve(svc, port=0)
+        try:
+            body = {"model": "m", "max_tokens": 300, "messages": [{"role": "user", "content": "fix it"}]}
+            req = urllib.request.Request(f"http://127.0.0.1:{httpd.server_address[1]}/v1/chat/completions",
+                                         data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+            with mock.patch.dict(os.environ, env or {}):
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    return json.loads(r.read())
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+    def test_closed_and_continued(self):
+        from serve.server import STOP_IN_THINKING_CLOSE
+        e = StopInThinkingEngine(ByteTokenizer())
+        b = self.run_one(e)
+        msg = b["choices"][0]["message"]
+        self.assertEqual((msg["reasoning_content"], msg["content"]), (e.THOUGHT + "\n", e.ANSWER))   # the close's newline
+        self.assertEqual(b["choices"][0]["finish_reason"], "stop")
+        first, second = e.prompts
+        self.assertEqual(second, first + e.tok.encode(e.THOUGHT) + e.tok.encode(STOP_IN_THINKING_CLOSE, parse_special=True))
+
+    def test_once_per_reply(self):
+        e = StopInThinkingEngine(ByteTokenizer(), stubborn=True)
+        b = self.run_one(e)
+        self.assertEqual(len(e.prompts), 2)                 # closed once; the second stop ends the reply
+        self.assertEqual(b["choices"][0]["finish_reason"], "stop")
+
+    def test_switched_off(self):
+        e = StopInThinkingEngine(ByteTokenizer())
+        b = self.run_one(e, {"STRATA_STOP_IN_THINKING": "0"})
+        self.assertEqual(len(e.prompts), 1)
+        self.assertEqual(b["choices"][0]["message"]["reasoning_content"], e.THOUGHT)
+        self.assertFalse(b["choices"][0]["message"].get("content"))
+
+    def test_normal_answer_untouched(self):
+        e = StopInThinkingEngine(ByteTokenizer(), normal=True)
+        b = self.run_one(e)
+        self.assertEqual(len(e.prompts), 1)
+        self.assertEqual(b["choices"][0]["message"]["content"], e.ANSWER)
+
+
 if __name__ == "__main__":
     unittest.main()

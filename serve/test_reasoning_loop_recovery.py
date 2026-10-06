@@ -193,3 +193,15 @@ class ReasoningLoopRecovery(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+# mab776 (#1053): these mock engines replay one script on every pass, so the continuation after a stop inside the
+# thinking (on by default in our server) is switched off here - the tests are about other features.
+def setUpModule():
+    import os
+    os.environ["STRATA_STOP_IN_THINKING"] = "0"
+
+
+def tearDownModule():
+    import os
+    os.environ.pop("STRATA_STOP_IN_THINKING", None)
