@@ -8727,7 +8727,7 @@ int main(int argc, char** argv) {
                                      "lower is skipped (+10..20%% decode on 12-16 GB cards that miss experts, answers differ slightly from 0.1.41); "
                                      "STRATA_ROUTE_TAIL_SKIP=0 turns it off\n", strata::core::tail_skip_rank(),
                              tse == nullptr ? " (default)" : "", strata::core::tail_skip_rank());
-            else if (tail_default_path && fork_pack)
+            else if (tse == nullptr && fork_pack && !all_experts_resident && o.batch == 0 && o.peer_device < 0)
                 std::fprintf(stderr, "strata serve: STRATA_ROUTE_TAIL_SKIP is OFF by default with this fork's packs (NVFP4, Q8_0 "
                                      "or their mix; it moved qwen-nvfp4-gptq's answers by KL 0.035, as much as the quantization's "
                                      "own error, and ended thinking sooner); STRATA_ROUTE_TAIL_SKIP=7 turns it on (+11.5%% decode "
