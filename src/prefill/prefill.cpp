@@ -71,7 +71,7 @@ bool supported(int) { return false; }
 bool fits(int, int64_t) { return false; }
 size_t matrix_bytes(int, int64_t, int64_t) { return 0; }
 size_t q8_bytes(int64_t, int64_t) { return 0; }
-void quantize(const float*, const int32_t*, void*, int, int64_t, int64_t, int64_t, void*, float*) {}
+void quantize(const float*, const int32_t*, void*, int, int64_t, int64_t, int64_t, void*, float*, const int32_t*, int) {}
 bool fp4_activations(int) { return false; }
 void quantize_scatter(const float*, const int32_t*, const int32_t*, void*, int, int64_t, int64_t, int64_t, int, void*) {}
 Context::Context() {}
@@ -84,6 +84,10 @@ void gather_strata_q2(const uint8_t*, void*, void*, void*) {}
 void swiglu(const float*, float*, int64_t, int64_t, bool, void*) {}
 void swiglu_scaled(const float*, float*, int64_t, int64_t, const int32_t*, int, const float*, int64_t, void*) {}
 void down_row_scales(float*, const int32_t*, int, const float*, int64_t, void*) {}
+bool swiglu_quant_ok(int) { return false; }
+void swiglu_quant(const float*, void*, int64_t, const int32_t*, int, const float* const*, int64_t, float*, void*) {}
+bool direct_ok(int) { return false; }
+bool token_rows_ok(int, int64_t) { return false; }
 void iota(int32_t*, int64_t, void*) {}
 bool tab_built() { return false; }
 bool tab_fits(int, int64_t) { return false; }
@@ -137,6 +141,40 @@ constexpr int STAGE = 8;           // host->device expert staging ring (chunks b
 // the group that read it was gathered (the walk stages at most STAGE_GRP - MMQ_GROUP - 1 entries ahead)
 constexpr int STAGE_GRP = 32;
 constexpr int kSplitHelpRing = 48;  // layer split help: the helper stage's ring slots it streams through (at most)
+// An NVFP4 group's swiglu, H's q8_1 rows and s_down per row in one kernel (mmq::swiglu_quant, the same bytes);
+// STRATA_PREFILL_SWIGLU_QUANT=0: the three kernels and H in floats.
+inline bool swiglu_quant_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_PREFILL_SWIGLU_QUANT");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    return on;
+}
+// STRATA_PREFILL_GROUP_GATHER=0: one gather, one wait and one record per expert (the streamed walk's MMQ groups)
+inline bool group_gather_env() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_PREFILL_GROUP_GATHER");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    return on;
+}
+// STRATA_PREFILL_IN_PLACE=0: every MMQ group gathered (see in_place in the streamed walk)
+inline bool in_place_env() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_PREFILL_IN_PLACE");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    return on;
+}
+// STRATA_PREFILL_TOKEN_ROWS=0: an in-place layer's gate/up activations scattered to every expert row of their token
+// (k_used copies each) instead of quantized once per token and read through the row -> token table
+inline bool token_rows_env() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_PREFILL_TOKEN_ROWS");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    return on;
+}
 // STRATA_PREFILL_STREAM_AHEAD=0 keeps the previous routed-only upload schedule (A/B).
 inline bool stream_ahead_enabled() {
     static const bool on = [] {
@@ -158,6 +196,13 @@ inline bool force_pageable() {
 // spinners starved a pinned host thread (DGX Spark IQ3_S 8K prompt 91 -> 1,222 tok/s with sleeping waits); on Windows
 // the 5070 read an 8K Q2_0 prompt 1.2% slower with them (1,469.5 -> 1,452 tok/s, 10 pairs), so they stay spinning
 // there.  Same output either way.  STRATA_STAGER_SLEEP=1/0 forces either.
+// extras/wddm-pin (Linux): the stager's copy threads and the stream issuer spread over the CPUs that are neither the
+// host's nor a pool worker's (aux_cpus::spread_current_thread) instead of inheriting the host thread's one CPU.
+// STRATA_STAGER_SPREAD=0: placed as before (the aux set while --aux-cpus is on, else where they were created).
+inline bool stager_spread() {
+    static const bool v = [] { const char* e = std::getenv("STRATA_STAGER_SPREAD"); return e == nullptr || e[0] != '0'; }();
+    return v;
+}
 inline bool stager_sleep() {
     static const bool v = [] {
         const char* e = std::getenv("STRATA_STAGER_SLEEP");
@@ -228,6 +273,18 @@ inline int64_t cpu_share_max() {
 // one stage at a time takes it for a chunk, the other reads its chunk with the GPU alone.
 std::atomic<bool> g_cpu_pool_busy{false};
 double g_pinned_share = 1.0;
+// extras/wddm-pin: the experts the GPU cannot DMA directly lie in RESIDENT RAM (the arena: locked, large pages where
+// possible), so the stager's copies are plain memcpy at RAM speed - not file reads, not a page-cache copy.  Then an
+// unpinned share is not a reason for the small ring (the 96 slots were measured where the host copies were the limit,
+// IQ3_S on a 64 GB PC): the staging pipeline keeps the pinned ring and gets more copy threads and pinned buffers
+// (Prefill::set_resident_stage; STRATA_STAGE_RESIDENT=0 keeps the old sizing).
+bool g_resident_stage = false;
+inline bool resident_stage() {
+    static const int env = [] { const char* v = std::getenv("STRATA_STAGE_RESIDENT"); return v == nullptr ? -1 : (v[0] != '0'); }();
+    return env < 0 ? g_resident_stage : env == 1;
+}
+// The streamed ring's full size: (nearly) every streamed expert pinned, or the unpinned ones staged from resident RAM.
+inline bool full_ring() { return g_pinned_share >= 0.9 || resident_stage(); }
 // The streamed ring: 384 slots when (nearly) every streamed expert is DMA'd from pinned RAM - measured on Q2_0,
 // 8192-token chunks: 96 slots 1153 tok/s, 384 1294 (the next layer's experts arrive during its attention half) -
 // and 96 when a large share goes through host copies (IQ3_S on 64 GB, a third unpinned: 96 slots 1216, 256 1070 -
@@ -279,7 +336,7 @@ inline int ring_cap() { return fused_ring() && !strata::kernels::cpu::expert_lay
 inline constexpr uint64_t Q2_0_BLOB = 1382400ull;   // the blob of the pack the ring was tuned on
 inline uint64_t ring_bytes() {
     const uint64_t slots = fused_ring() ? 1024ull : 384ull;   // #136: a fused ring holds two layers' experts
-    return (g_pinned_share >= 0.9 ? slots : slots / 4) * Q2_0_BLOB;
+    return (full_ring() ? slots : slots / 4) * Q2_0_BLOB;
 }
 // ...and what that buys on THIS pack, never past ring_cap(): the slot count `init` lays out, and what the auto
 // chunk scan treats as a full ring.  A pack whose blobs are larger than Q2_0's gets fewer slots for the same
@@ -319,7 +376,7 @@ inline int ring_slots(size_t T) {
     // is not what is competing for VRAM.
     // 0.1.39's ring (1024 fused / 384 pinned, 96 when a large share goes through host copies), and the #583 byte
     // budget the auto scan chose for chunks past the size 0.1.39's rule would have picked (set_ring_budget)
-    const int pinned_ring = g_pinned_share >= 0.9 ? (fused_ring() ? 1024 : 384) : 96;
+    const int pinned_ring = full_ring() ? (fused_ring() ? 1024 : 384) : 96;
     const bool budget = ring_bytes_on() && g_ring_budget > 0 && (int64_t) T > g_ring_small_max;
     const int r = v ? std::atoi(v) : g_ring_override > 0 ? g_ring_override : budget ? g_ring_budget : pinned_ring;
     if (v && r == STAGE) return STAGE; // Explicit opt-in to routed-only staging, including large chunks.
@@ -582,7 +639,7 @@ struct Stager {
                 strata::platform::name_this_thread("strata-stage");
                 static const bool keep = [] { const char* v = std::getenv("STRATA_AUX_STAGER"); return v != nullptr && std::atoi(v) == 0; }();
                 if (keep) strata::aux_cpus::note_owned_thread();
-                else strata::aux_cpus::pin_current_thread();
+                else if (!(stager_spread() && strata::aux_cpus::spread_current_thread())) strata::aux_cpus::pin_current_thread();
                 work();
             });
         return true;
@@ -1458,8 +1515,15 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
                 std::fprintf(stderr, "prefill: the GGUF experts are %.0f%% in the page cache; the stager takes the RAM profile\n", warm * 100.0);
             }
         }
-        const int threads = stv ? std::clamp(std::atoi(stv), 1, 32) : files ? 32 : std::max(2, std::min(4, hw / 4));
+        // extras/wddm-pin: a large unpinned share staged from resident RAM: 8 copy threads (a quarter of the CPU's, at
+        // least 4) and 64 pinned buffers (~180 MiB of NVFP4 blobs, charged to the GPU's shared budget like any pin).
+        // One memcpy thread already moves ~30 GB/s on a dual-channel DDR5 PC and the pipeline tops at ~25 GB/s there
+        // (RAM-bound: read, write, the DMA's read); the buffers let the copies run a layer's worth ahead of the DMAs.
+        const bool stage_big = !files && g_pinned_share < 0.9 && resident_stage();
+        const int threads = stv ? std::clamp(std::atoi(stv), 1, 32) : files ? 32 :
+                            stage_big ? std::max(4, std::min(8, hw / 4)) : std::max(2, std::min(4, hw / 4));
         if (files && std::getenv("STRATA_STAGER_RING") == nullptr) m.stager->kRing = 4 * threads;
+        if (stage_big && std::getenv("STRATA_STAGER_RING") == nullptr) m.stager->kRing = 64;
         // pp-opt: with files, each thread claims runs of neighbouring blobs and reads them as one request (copy_blobs);
         // STRATA_STAGER_BATCH=1 is the A/B arm (one blob per request, as before)
         {
@@ -1469,6 +1533,12 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         }
         if (!m.stager->init((size_t) MAXBLOB(), threads)) ok = false;
         m.stager->batch = std::min(m.stager->batch, m.stager->kRing);
+        if (stage_big)
+            std::fprintf(stderr, "prefill: %.0f%% of the expert bytes are not pinned: the stager copies them from resident RAM with "
+                                 "%d threads into %d pinned buffers (%.0f MiB) and the streamed ring keeps its pinned size "
+                                 "(STRATA_STAGE_RESIDENT=0: 4 threads, 16 buffers, a quarter ring)\n",
+                         100.0 * (1.0 - g_pinned_share), threads, m.stager->kRing,
+                         (double) m.stager->kRing * (double) MAXBLOB() / 1048576.0);
     }
     m.steps_host.resize(T * strata::kernels::kStepCount);
     m.steps_up.init(T * strata::kernels::kStepCount);
@@ -2202,6 +2272,7 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& e
 }
 
 void Prefill::set_pinned_share(double share) { g_pinned_share = share; }
+void Prefill::set_resident_stage(bool on) { g_resident_stage = on; }
 void Prefill::set_ring_override(int slots) { g_ring_override = slots > 0 ? slots : 0; }
 void Prefill::set_ring_budget(int slots, int64_t small_max) {
     g_ring_budget = slots > 0 ? slots : 0;
@@ -2381,7 +2452,7 @@ uint64_t Prefill::bytes_needed_no_ring(const core::ModelGeometry& g, const core:
 }
 
 int64_t Prefill::ring_default_slots() {
-    const int r = g_pinned_share >= 0.9 ? (fused_ring() ? 1024 : 384) : 96;
+    const int r = full_ring() ? (fused_ring() ? 1024 : 384) : 96;
     return (int64_t) std::min(r, ring_cap());
 }
 
@@ -2396,7 +2467,7 @@ int64_t Prefill::ring_cap_for(int64_t old_chunk) {
 
 // the unpinned arm keeps its measured 96 (the PR's rule; the byte budget would have been ~49 slots on IQ3_S)
 int64_t Prefill::ring_max_slots() {
-    return g_pinned_share >= 0.9 ? (int64_t) ring_budget_slots() : (int64_t) std::min(96, ring_cap());
+    return full_ring() ? (int64_t) ring_budget_slots() : (int64_t) std::min(96, ring_cap());
 }
 
 int64_t Prefill::ring_slots_for(int64_t chunk) { return ring_slots((size_t) chunk); }
@@ -3008,7 +3079,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         if (threaded_issue) {
             issuer = std::thread([&] {
                 strata::platform::name_this_thread("strata-issue");
-                strata::aux_cpus::pin_current_thread();
+                if (!(stager_spread() && strata::aux_cpus::spread_current_thread())) strata::aux_cpus::pin_current_thread();
                 const core::OnDevice od(m.device);
                 for (size_t idx = 0; idx < seq.size(); ++idx) {
                     while (idx >= a_consumed.load(std::memory_order_acquire) + (size_t) m.ring) {
@@ -3043,7 +3114,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             if (!threaded_issue) return;
             while (a_issued.load(std::memory_order_acquire) <= k) std::this_thread::yield();
         };
+        size_t given_back = 0;   // the issuer may fill slots up to given_back + ring
         auto give_back = [&](size_t upto) {
+            given_back = upto;
             if (threaded_issue) a_consumed.store(upto, std::memory_order_release);
             else issue_until(upto + (size_t) m.ring);
         };
@@ -3159,6 +3232,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 if (gr_unfused()) gr_norm(m.R, (const float*) wn->data, EPS, m.xn, m.xn16, T, m.cs, m.xn16_lo, xf16);
                 else if (!normed) gr_norm_rs(m.R, (const float*) wn->data, EPS, m.grs, m.xn16, T, m.cs, m.xn16_lo, ldx, xf16);
                 normed = false;
+                bool moe_wrote = false;   // the MoE half's combine also did the write below (moe_combine_write_norm_rs)
                 bool hcd = false;
                 bool hdown = false;
                 if (wd->q8_scale == nullptr && ldx != D && !pf_hcdown()) {   // not with STRATA_HC_REQ8's int8 rows   // STRATA_HCD_EXACT: the exact-order down kernel when hipBLASLt would take 1176 / 1177
@@ -3586,6 +3660,18 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     const float* had_sh = had_d ? m.had_sh[(size_t) l] : nullptr;
                     const int mmq_gt = lay.native ? lay.fmt[(size_t) l].gu_type : 42;
                     const int mmq_dt = lay.native ? lay.fmt[(size_t) l].d_type : 42;
+                    // the streamed walk's MMQ groups: gathered in one launch each; in place (no gather) where the
+                    // products can read each expert where it lies; then gate/up's activations once per token
+                    const bool group_gather_l = group_gather_env() && stream_all && use_mmq && lay.native &&
+                                                MMQ_GROUP <= mmq::kGatherGroupMax;
+                    // (not with --peer-device: set_peer can decline a pack and leave m.pp null, the peer's slots and
+                    // buffers sized for the gathered groups all the same)
+                    const bool in_place_l = in_place_env() && group_gather_l && lay.fmt[(size_t) l].tail_off &&
+                                            swiglu_quant_on() && mmq::swiglu_quant_ok(mmq_dt) &&
+                                            mmq::direct_ok(mmq_gt) && mmq::direct_ok(mmq_dt) &&
+                                            !core::peer_portable() && !(m.pp && m.pp->peer) &&
+                                            !(m.cache && mmq_plan().direct[(size_t) l]);   // mab776 port: not beside upstream's pointer table
+                    const bool tok_rows_l = in_place_l && token_rows_env() && mmq::token_rows_ok(mmq_gt, N);
                     // --peer-device: MMQ only, whether or not the peer took the prompt path (set_peer can decline), as
                     // fused_ring() sized the ring and the buffers for it
                     const bool no_peer = !core::peer_portable();
@@ -4040,8 +4126,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     strata::kernels::hadamard_rows(m.mixed, m.Xr, T, N, had_block, had_sx, m.cs);
                                     xsrc = m.Xr;
                                 }
-                                if (mmq::fp4_activations(mmq_gt))
-                                    mmq::quantize(xsrc, m.src_dev, m.Xq, mmq_gt, N, N, T * K, m.cs, m.Xscale);
+                                if (tok_rows_l)   // fork (mab776 port): in place + w4a4x2 gate/up read each token's row once (Product::y_rows)
+                                    mmq::quantize(xsrc, nullptr, m.Xq, mmq_gt, N, N, T, m.cs, m.Xscale);
+                                else if (mmq::fp4_activations(mmq_gt))
+                                    // fork w4a4x2 (mab776 port): FP4 activations scattered per token through slot_dev
+                                    mmq::quantize(xsrc, m.src_dev, m.Xq, mmq_gt, N, N, T * K, m.cs, m.Xscale, m.slot_dev, (int) K);
                                 else
                                     mmq::quantize_scatter(xsrc, m.slot_dev, m.src_dev, m.Xq, mmq_gt, N, N, T, (int) K, m.cs);
                             }
@@ -4440,6 +4529,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         // entry the routing skipped inside an open group first gathers what the group holds so far
                         // (`flush`), so no more than a group's entries are ever held back from the issuer.
                         // STRATA_PREFILL_GROUP_GATHER=0: one gather, one wait and one record per expert.
+                        // In place: a group's products read each expert's blob where it lies (its ring slot or cache
+                        // slot) through a pointer per expert, with no gather; its ring slots are released after the
+                        // down product instead.  The same sums (moe_mmq.hpp, Product::w_ptrs).  Experts a skipped ring
+                        // entry forced out of an open group (flush) are still gathered and read from the group slots.
+                        // STRATA_PREFILL_IN_PLACE=0: every group gathered.
+                        const bool in_place = in_place_l;
                         mmq::GatherGroup gg;
                         int gg_slots[MMQ_GROUP];
                         int gg_nslots = 0;   // ring slots gathered by the next flush
@@ -4527,8 +4622,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     gg.n = (int) q + 1;
                                     if (slot >= 0) gg_slots[gg_nslots++] = slot;
                                     if (!last_of_group) return true;
-                                    flush(MMQ_TAIL);
-                                    gg = mmq::GatherGroup{};
+                                    if (!in_place) {
+                                        flush(MMQ_TAIL);
+                                        gg = mmq::GatherGroup{};
+                                    }
                                 } else if (lay.native) {
                                     const auto& f = lay.fmt[(size_t) l];
                                     // NVFP4: this expert's scales go next to its group slot in the same launch
@@ -4552,6 +4649,27 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 const int64_t r0 = m.bounds_host[j0], nr = m.bounds_host[j + 1] - r0;
                                 int64_t maxr = 0;
                                 for (size_t i = j0; i <= j; ++i) maxr = std::max<int64_t>(maxr, m.cnt[(size_t) order[i]]);
+                                const bool scaled = lay.native && lay.fmt[(size_t) l].tail_off;
+                                // NVFP4 tails: swiglu, H's q8_1 rows and the rows' s_down in one pass (the same bytes)
+                                const bool sq = scaled && swiglu_quant_on() && mmq::swiglu_quant_ok(mmq_dt);
+                                // each expert's gate/up, down and tail: in place, or its group slots (a group not in
+                                // place, and the experts [0, gg.first) a flush gathered)
+                                const void* gu_at[MMQ_GROUP];
+                                const void* d_at[MMQ_GROUP];
+                                const float* tail_at[MMQ_GROUP];
+                                const int n_gathered = in_place ? gg.first : ngx;
+                                for (int i = 0; i < ngx; ++i) {
+                                    const bool gathered = i < n_gathered;
+                                    const auto& f = lay.fmt[(size_t) l];
+                                    gu_at[i] = gathered ? (const void*) (m.grp_gu + (size_t) i * mmq_gub) : (const void*) gg.blob[i];
+                                    d_at[i] = gathered ? (const void*) (m.grp_d + (size_t) i * mmq_db)
+                                                       : (const void*) (gg.blob[i] + f.down_off);
+                                    tail_at[i] = gathered ? m.grp_tail + i * 4 : (const float*) (gg.blob[i] + f.tail_off);
+                                }
+                                if (in_place && gg_nslots > 0) {   // the copies land in order: the last one covers all
+                                    pt.mark(kPfWaitCopy, cs);
+                                    cudaStreamWaitEvent(m.cs, m.copied[gg_slots[gg_nslots - 1]], 0);
+                                }
                                 pt.mark(kPfGemmGU, cs);
                                 if (wmma_l) {   // pf_wmma: gate/up, SwiGLU to FP16, down - the group in 2 tile launches
                                     const int32_t* dnb = m.bounds_dev + n + 1 + g * (MMQ_GROUP + 1);
@@ -4581,8 +4699,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 gu.total_rows = T * K; gu.max_rows = maxr; gu.dst = m.GU; gu.ld_dst = 1280;
                                 gu.y_scale = mmq::fp4_activations(mmq_gt) ? m.Xscale : nullptr;
                                 if (direct) gu.tab = &tgu;
+                                gu.w_ptrs = in_place ? gu_at : nullptr;
+                                if (tok_rows_l) { gu.y_rows = m.src_dev; gu.y_count = T; }
                                 m.mmq_ctx->run(gu, m.cs);
-                                if (lay.native && lay.fmt[(size_t) l].tail_off)   // gate/up scales applied as read
+                                if (sq)
+                                    mmq::swiglu_quant(m.GU + r0 * 1280, m.Hq, nr, m.bounds_dev + j0, ngx, tail_at, r0,
+                                                      m.row_sd + r0, m.cs);
+                                else if (scaled)   // gate/up scales applied as read
                                     mmq::swiglu_scaled(m.GU + r0 * 1280, m.H + r0 * 640, nr, 640, m.bounds_dev + j0, ngx,
                                                        m.grp_tail, r0, m.cs);
                                 else
@@ -4590,7 +4713,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 if (had_d)
                                     strata::kernels::hadamard_rows(m.H + r0 * 640, m.H + r0 * 640, nr, 640, had_block, had_sh, m.cs);
                                 pt.mark(kPfGemmD, cs);
-                                mmq::quantize(m.H + r0 * 640, nullptr, m.Hq, mmq_dt, 640, 640, nr, m.cs, m.Hscale);
+                                if (!sq) mmq::quantize(m.H + r0 * 640, nullptr, m.Hq, mmq_dt, 640, 640, nr, m.cs, m.Hscale);
                                 mmq::Product dn;
                                 dn.w = m.grp_d; dn.type = mmq_dt; dn.w_rows = N; dn.w_cols = 640; dn.expert_bytes = mmq_db;
                                 dn.n = ngx; dn.xq = m.Hq; dn.bounds = m.bounds_dev + n + 1 + g * (MMQ_GROUP + 1);
@@ -4598,14 +4721,24 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 dn.ld_dst = N;
                                 dn.y_scale = mmq::fp4_activations(mmq_dt) ? m.Hscale : nullptr;
                                 if (direct) dn.tab = &td;
+                                dn.w_ptrs = in_place ? d_at : nullptr;
                                 m.mmq_ctx->run(dn, m.cs);
-                                if (lay.native && lay.fmt[(size_t) l].tail_off)   // s_down: applied by the combine
+                                if (scaled && !sq)   // s_down: applied by the combine
                                     mmq::down_row_scales(m.row_sd + r0, dn.bounds, ngx, m.grp_tail, nr, m.cs);
                                 if (direct) {
                                     tgu = mmq::WeightTab{};
                                     td = mmq::WeightTab{};
                                     gd = mmq::GuardTab{};
                                     ns = 0;
+                                }
+                                if (in_place) {   // the group's ring slots, read by now: ONE event releases them
+                                    if (gg_nslots > 0) {
+                                        const int rel = gg_slots[gg_nslots - 1];
+                                        cudaEventRecord(m.used[rel], m.cs);
+                                        for (int i = 0; i < gg_nslots; ++i) m.used_of[gg_slots[i]] = rel;
+                                    }
+                                    gg_nslots = 0;
+                                    gg = mmq::GatherGroup{};
                                 }
                                 return true;
                             }
@@ -4673,12 +4806,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             const size_t kend = seq_start[(size_t) l + 1];
                             auto release_to = [&](int32_t e_stop) {
                                 while (k < kend && seq[k].e < e_stop) {
-                                    if (gg_nslots > 0) flush(0);   // the open group's slots get their event first
+                                    // in place, the open group is not gathered for it: this slot goes back with the
+                                    // group's after its products (unless that would hold back half the ring)
+                                    const bool defer = in_place && gg_nslots > 0 && k + 1 - given_back < (size_t) m.ring / 2;
+                                    if (gg_nslots > 0 && !defer) flush(0);   // the open group's slots get their event first
                                     const int sl = (int) (k % (size_t) m.ring);
                                     cudaEventRecord(m.used[sl], m.cs);
                                     m.used_of[sl] = sl;
                                     consumed = ++k;
-                                    give_back(consumed);
+                                    if (gg_nslots == 0) give_back(consumed);
                                 }
                             };
                             for (size_t j = 0; j < order.size(); ++j) {
@@ -4739,13 +4875,33 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         if (!m.pp->p2p && !m.pp->sums)
                             copy_f32_wide(m.Dm + (size_t) m.pp->back_at * N, m.pp->host_rows, m.pp->back_rows * N, m.cs);
                     }
-                    if (peer_now && m.pp->sums && m.pp->f16)
+                    const float* row_sd_l = use_mmq && !fused_l && lay.native && lay.fmt[(size_t) l].tail_off ? m.row_sd : nullptr;
+                    // The combine and the write below in one kernel where that write is gr_write_norm_rs (the same
+                    // conditions: not steered, a next layer, not before layer 1's PLE block) and the combine is the
+                    // plain one (not with the peer's sums): bo never stored, the same bits.
+                    // STRATA_PREFILL_COMBINE_WRITE=0: the two kernels.
+                    static const bool combine_write_env = [] {
+                        const char* e = std::getenv("STRATA_PREFILL_COMBINE_WRITE");
+                        return e == nullptr || std::atoi(e) != 0;
+                    }();
+                    static const bool combine_dbg = std::getenv("STRATA_DBG_NAN") != nullptr;   // it reads bo
+                    const bool peer_sums = peer_now && m.pp->sums;
+                    if (combine_write_env && !combine_dbg && !peer_sums && !xf16 && half == 1 && !strata::kernels::cvec().covers(l) &&
+                        !gr_unfused() && l + 1 < LE && !(l + 1 == 1 && ple_on)) {
+                        const core::LayerView vn(*m.wt, l + 1);
+                        const core::WeightRef* wnn_c = need(vn, "hc_attn_norm.weight", err);
+                        if (!wnn_c) return false;
+                        moe_wrote = moe_combine_write_norm_rs(m.Dm, m.slot_dev, m.w, m.shared, m.sg, row_sd_l, m.R, m.inj,
+                                                              HC, (const float*) wnn_c->data, EPS, m.grs, m.xn16, T, m.cs,
+                                                              m.xn16_lo, ldx);
+                    }
+                    if (moe_wrote) {
+                    } else if (peer_sums && m.pp->f16)
                         moe_combine_peer16(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.pp->host_sum16, m.pp->back_at, m.bo, T, m.cs);
-                    else if (peer_now && m.pp->sums)
+                    else if (peer_sums)
                         moe_combine_peer(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.pp->host_sum, m.pp->back_at, m.bo, T, m.cs);
                     else
-                        moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs,
-                                    use_mmq && !fused_l && lay.native && lay.fmt[(size_t) l].tail_off ? m.row_sd : nullptr);
+                        moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs, row_sd_l);
                     // debug: STRATA_DBG_NAN=1 reports the first layer of a chunk whose MoE produced non-finite values
                     if (static const bool dbg = std::getenv("STRATA_DBG_NAN") != nullptr; dbg) {
                         cudaStreamSynchronize(m.cs);
@@ -4828,8 +4984,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                           T, m.cs, m.xn16_lo, ldx, xf16);
                     normed = true;
                 } else if (wnn) {
-                    gr_write_norm_rs(m.R, m.bo, m.inj, HC, (const float*) wnn->data, EPS, m.grs, m.xn16, T, m.cs,
-                                     m.xn16_lo, ldx, xf16);
+                    if (!moe_wrote)
+                        gr_write_norm_rs(m.R, m.bo, m.inj, HC, (const float*) wnn->data, EPS, m.grs, m.xn16, T, m.cs,
+                                         m.xn16_lo, ldx, xf16);
                     normed = true;
                 } else {
                     gr_write(m.R, m.bo, m.inj, HC, T, m.cs);
