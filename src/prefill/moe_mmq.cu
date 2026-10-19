@@ -158,6 +158,56 @@ __global__ void swiglu_scaled_kernel(const float* __restrict__ gu, float* __rest
     const float g = row[k] * tails[4 * q], u = row[n_ff + k] * tails[4 * q + 1];
     h[i] = g / (1.0f + __expf(-g)) * u;
 }
+// swiglu_scaled_kernel, quantize_mmq_q8_1<D4>'s rows of its output and down_row_scales_kernel in one pass: a block per
+// row (128 threads, 4 values each, blockIdx.y the row's 512-value half), H never stored.  Each value is
+// swiglu_scaled's expression and each 32-value block quantize_mmq_q8_1's (the same unit and flags: the same bits).
+// sd (null: none) gets the row's s_down.
+struct TailPtrs {
+    const float* p[kGatherGroupMax];   // expert q's {s_gate, s_up, s_down, 0}
+};
+__global__ void __launch_bounds__(128) swiglu_quant_kernel(const float* __restrict__ gu, block_q8_1_mmq* __restrict__ y,
+                                                           int64_t rows, const int32_t* __restrict__ bounds, int n,
+                                                           const TailPtrs tp, int64_t row0, float* __restrict__ sd) {
+    constexpr int64_t n_ff = 640, ne0 = 1024;   // the padded row: pad512(640)
+    const int64_t i0 = ((int64_t) blockDim.x * blockIdx.y + threadIdx.x) * 4;
+    if (i0 >= ne0) return;
+    const int64_t r = blockIdx.x, ra = row0 + r;
+    int q = 0;
+    while (q + 1 < n && ra >= bounds[q + 1]) ++q;
+    const float* tails = tp.p[0];   // tp.p[q] by selects: a parameter array indexed per thread is copied to the stack
+#pragma unroll
+    for (int i = 1; i < kGatherGroupMax; ++i)
+        if (i == q) tails = tp.p[i];
+    float4 xi = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    if (i0 < n_ff) {
+        const float* row = gu + r * 2 * n_ff;
+        const float4 g4 = *reinterpret_cast<const float4*>(row + i0), u4 = *reinterpret_cast<const float4*>(row + n_ff + i0);
+        const float sg = tails[0], su = tails[1];
+        float g, u;
+        g = g4.x * sg; u = u4.x * su; xi.x = g / (1.0f + __expf(-g)) * u;
+        g = g4.y * sg; u = u4.y * su; xi.y = g / (1.0f + __expf(-g)) * u;
+        g = g4.z * sg; u = u4.z * su; xi.z = g / (1.0f + __expf(-g)) * u;
+        g = g4.w * sg; u = u4.w * su; xi.w = g / (1.0f + __expf(-g)) * u;
+    }
+    if (sd != nullptr && i0 == 0) sd[r] = tails[2];
+    float amax = fabsf(xi.x);
+    amax = fmaxf(amax, fabsf(xi.y));
+    amax = fmaxf(amax, fabsf(xi.z));
+    amax = fmaxf(amax, fabsf(xi.w));
+#pragma unroll
+    for (int offset = 32 / 8; offset > 0; offset >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset, WARP_SIZE));
+    const float d_inv = 127.0f / amax;
+    char4 c;
+    c.x = roundf(xi.x * d_inv);
+    c.y = roundf(xi.y * d_inv);
+    c.z = roundf(xi.z * d_inv);
+    c.w = roundf(xi.w * d_inv);
+    const float d = 1.0f / d_inv;
+    const int64_t k_block = i0 / QK8_1_MMQ, iqs = i0 % QK8_1_MMQ;
+    block_q8_1_mmq* yb = y + k_block * rows + r;
+    reinterpret_cast<char4*>(yb->qs)[iqs / 4] = c;
+    if (iqs % 32 == 0) yb->d4[iqs / 32] = d;
+}
 __global__ void down_row_scales_kernel(float* __restrict__ sd, const int32_t* __restrict__ bounds, int n,
                                        const float* __restrict__ tails, int64_t nrows) {
     const int64_t r = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -243,22 +293,43 @@ bool tab_has_type(int) { return false; }
 }  // namespace
 
 // mmq_nvfp4_w4a8.cu: mmq.cuh's int8 NVFP4 path, compiled for this GPU with Blackwell's FP4 MMA hidden
-void run_nvfp4_w4a8(ggml_backend_cuda_context& ctx, const mmq_args& a, cudaStream_t s);
+// (w: n pointers, each expert's weights where they lie - null: a.x + z x its stride, as gathered)
+void run_nvfp4_w4a8(ggml_backend_cuda_context& ctx, const mmq_args& a, cudaStream_t s, const void* const* w = nullptr,
+                    int n = 0);
+// mmq_q8_0_xp.cu: Q8_0 with the experts where they lie (w non-null)
+void run_q8_0_xp(ggml_backend_cuda_context& ctx, const mmq_args& a, cudaStream_t s, const void* const* w, int n);
 // mmq_nvfp4_w4a4.cu (the one unit built for 12xa): FP4 x FP4 and its activation quantizer, if this card runs it
 bool w4a4_available();
 void run_nvfp4_w4a4(ggml_backend_cuda_context& ctx, const mmq_args& a, cudaStream_t s);
 void quantize_nvfp4_w4a4(const float* x, const int32_t* ids, void* xq, float* yscale, bool aligned, int64_t cols,
                          int64_t ld, int64_t rows, int64_t padded, cudaStream_t s);
+// mmq_nvfp4_a44.cu (12xa too): two FP4 activation terms through the FP4 MMA, and their quantizer
+bool a44_available();
+void run_nvfp4_a44(ggml_backend_cuda_context& ctx, const mmq_args& a, cudaStream_t s, const void* const* w = nullptr,
+                   int n = 0, const int32_t* y_rows = nullptr);
+void quantize_nvfp4_x2(const float* x, const int32_t* ids, void* xq, float* yscale, int64_t cols, int64_t ld,
+                       int64_t rows, int64_t padded, cudaStream_t s);
+void quantize_nvfp4_x2_scatter(const float* x, const int32_t* slot, void* xq, float* yscale, int64_t cols, int64_t ld,
+                               int64_t tokens, int k_used, int64_t padded, cudaStream_t s);
+// w4a4x2: the products whose K is at least this take two FP4 terms (gate/up, K 2560); below it w4a8 (down, K 640:
+// two FP4 passes there, 0.206 ms, lose to w4a8's 0.185 at 32K - mmq_expert_bench)
+constexpr int64_t kX2MinK = 2048;
+bool x2_mode();
 
 bool built() { return true; }
 
 Nvfp4Mode nvfp4_mode() {
     static const Nvfp4Mode m = [] {
+        // the fork's default: w4a4x2 (falls back to w4a8 without sm_120a).  8 prompts (250 tokens - 32K) against a
+        // high-precision reference, with the IMMA attention and the chunked recurrence: first-token KL median 0.0026
+        // against w4a8's 0.0025, the same top token, the 32 greedy tokens the reference's on 7 of 8 (w4a8: 6)
         const char* e = std::getenv("STRATA_PREFILL_NVFP4");
-        if (e == nullptr || std::strcmp(e, "w4a8") == 0) return Nvfp4Mode::W4A8;
+        if (e == nullptr || std::strcmp(e, "w4a4x2") == 0) return Nvfp4Mode::W4A4X2;
+        if (std::strcmp(e, "w4a8") == 0) return Nvfp4Mode::W4A8;
         if (std::strcmp(e, "w4a4") == 0) return Nvfp4Mode::W4A4;
         if (std::strcmp(e, "fp16") == 0) return Nvfp4Mode::FP16;
-        std::fprintf(stderr, "STRATA_PREFILL_NVFP4=%s: expected w4a8, w4a4 or fp16\n", e);
+        if (std::strcmp(e, "w4a4x2") == 0) return Nvfp4Mode::W4A4X2;
+        std::fprintf(stderr, "STRATA_PREFILL_NVFP4=%s: expected w4a8, w4a4, w4a4x2 or fp16\n", e);
         std::exit(1);
     }();
     return m;
@@ -348,11 +419,26 @@ __global__ void scale_down_rows_kernel(float* __restrict__ d, int64_t ld, const 
 }
 }  // namespace
 
+bool x2_mode() {
+#if defined(GGML_USE_HIP)
+    return false;
+#else
+    if (nvfp4_mode() != Nvfp4Mode::W4A4X2) return false;
+    static const bool on = [] {
+        const bool ok = a44_available();
+        if (!ok) std::fprintf(stderr, "prefill mmq: STRATA_PREFILL_NVFP4=w4a4x2 needs an sm_12x card in a 12x build; W4A8\n");
+        return ok;
+    }();
+    return on;
+#endif
+}
+
 bool fp4_activations(int t) {
 #if defined(GGML_USE_HIP)   // no NVFP4 MMQ on HIP (and no W4A4 unit)
     (void) t;
     return false;
 #else
+    if (t == GGML_TYPE_NVFP4 && x2_mode()) return true;
     if (t != GGML_TYPE_NVFP4 || nvfp4_mode() != Nvfp4Mode::W4A4) return false;
     static const bool on = [] {
         const bool ok = w4a4_available();
@@ -377,10 +463,20 @@ void scale_down_rows(float* d, int64_t ld, const int32_t* bounds, int n, const f
 }
 
 void quantize(const float* x, const int32_t* ids, void* xq, int t, int64_t cols, int64_t ld, int64_t rows, void* stream,
-              float* yscale) {
+              float* yscale, const int32_t* slot, int k_used) {
     if (rows <= 0) return;
+    // a token's K rows are the same row of x: quantized once and scattered (the per-row gather did it K times)
+    static const bool gather = [] { const char* e = std::getenv("STRATA_QUANT_GATHER"); return e != nullptr && std::atoi(e) != 0; }();
+    const bool scatter = slot != nullptr && k_used > 0 && rows % k_used == 0 && !gather;
 #if !defined(GGML_USE_HIP)
-    if (fp4_activations(t)) {
+    if (t == GGML_TYPE_NVFP4 && x2_mode() && cols >= kX2MinK) {   // w4a4x2: two FP4 terms (gate/up)
+        if (yscale == nullptr) { std::fprintf(stderr, "prefill mmq: NVFP4 activations need a scale buffer\n"); std::exit(1); }
+        if (scatter) quantize_nvfp4_x2_scatter(x, slot, xq, yscale, cols, ld, rows / k_used, k_used, pad512(cols), (cudaStream_t) stream);
+        else quantize_nvfp4_x2(x, ids, xq, yscale, cols, ld, rows, pad512(cols), (cudaStream_t) stream);
+        ck(cudaGetLastError(), "quantize");
+        return;
+    }
+    if (fp4_activations(t) && !x2_mode()) {
         if (yscale == nullptr) { std::fprintf(stderr, "prefill mmq: NVFP4 activations need a scale buffer\n"); std::exit(1); }
         const bool aligned = ((uintptr_t) x % 32 == 0) && ((size_t) ld * sizeof(float)) % 32 == 0;
         quantize_nvfp4_w4a4(x, ids, xq, yscale, aligned, cols, ld, rows, pad512(cols), (cudaStream_t) stream);
@@ -389,6 +485,12 @@ void quantize(const float* x, const int32_t* ids, void* xq, int t, int64_t cols,
     }
 #endif
     (void) yscale;
+    if (scatter) {
+        quantize_scatter_mmq_q8_1_cuda(x, slot, xq, (ggml_type) t, cols, ld, pad512(cols), rows / k_used, rows, k_used,
+                                       (cudaStream_t) stream);
+        ck(cudaGetLastError(), "quantize");
+        return;
+    }
     quantize_mmq_q8_1_cuda(x, ids, xq, (ggml_type) t, cols, ld, rows * ld, rows * ld, pad512(cols), rows, 1, 1,
                            (cudaStream_t) stream);
     ck(cudaGetLastError(), "quantize");
@@ -425,6 +527,10 @@ void Context::run(const Product& p, void* stream) {
                         p.max_rows, p.max_rows};
     auto& ctx = *(ggml_backend_cuda_context*) ctx_;
     const cudaStream_t s = (cudaStream_t) stream;
+    if (p.y_rows != nullptr && !(p.w_ptrs != nullptr && t == GGML_TYPE_NVFP4 && x2_mode() && p.w_cols >= kX2MinK)) {
+        std::fprintf(stderr, "prefill mmq: a row table needs an in-place w4a4x2 product\n");
+        std::exit(1);
+    }
     if (p.tab) {
         if (p.n > kGatherGroupMax) {
             std::fprintf(stderr, "prefill mmq: a pointer table holds at most %d experts (got %d)\n", kGatherGroupMax, p.n);
@@ -442,6 +548,26 @@ void Context::run(const Product& p, void* stream) {
         run_tab(&ctx, &a, nullptr, s);
 #endif
         ck(cudaGetLastError(), "mul_mat_q (pointer table)");
+        return;
+    } else if (p.w_ptrs != nullptr) {   // each expert where it lies (fork, mab776 port) (direct_ok decided the type and mode)
+        if (p.n > kGatherGroupMax || !direct_ok(p.type)) {
+            std::fprintf(stderr, "prefill mmq: type %d over %d experts cannot be read in place\n", p.type, p.n);
+            std::exit(1);
+        }
+#if !defined(GGML_USE_HIP)
+        if (t == GGML_TYPE_Q8_0) {
+            run_q8_0_xp(ctx, a, s, p.w_ptrs, p.n);
+        } else if (x2_mode() && p.w_cols >= kX2MinK) {
+            mmq_args ay = a;
+            if (p.y_rows != nullptr) ay.ncols_y = p.y_count;   // the activation buffer's rows (the layout's stride)
+            run_nvfp4_a44(ctx, ay, s, p.w_ptrs, p.n, p.y_rows);
+        } else {
+            mmq_args a8 = a;
+            if (x2_mode()) a8.y_scale = nullptr;   // q8_1 rows below kX2MinK, as below
+            run_nvfp4_w4a8(ctx, a8, s, p.w_ptrs, p.n);
+        }
+#endif
+        ck(cudaGetLastError(), "mul_mat_q");
         return;
     }
     switch (t) {
@@ -479,7 +605,15 @@ void Context::run(const Product& p, void* stream) {
 #endif
 #if !defined(GGML_USE_HIP)   // NVFP4: CUDA only (no HIP instance, no W4A8 unit)
         case GGML_TYPE_NVFP4:
-            if (fp4_activations(t)) run_nvfp4_w4a4(ctx, a, s);
+            if (x2_mode()) {
+                if (p.w_cols >= kX2MinK) {
+                    run_nvfp4_a44(ctx, a, s);
+                } else {   // below kX2MinK the activations are q8_1 (quantize): w4a8, without the FP4 row scale
+                    mmq_args a8 = a;
+                    a8.y_scale = nullptr;
+                    run_nvfp4_w4a8(ctx, a8, s);
+                }
+            } else if (fp4_activations(t)) run_nvfp4_w4a4(ctx, a, s);
             else run_nvfp4_w4a8(ctx, a, s);
             break;
 #endif
@@ -652,6 +786,39 @@ void swiglu_scaled(const float* gu, float* h, int64_t rows, int64_t n_ff, const 
     if (rows <= 0) return;
     swiglu_scaled_kernel<<<blocks(rows * n_ff), 256, 0, (cudaStream_t) stream>>>(gu, h, rows, n_ff, bounds, n, tails, row0);
     ck(cudaGetLastError(), "swiglu_scaled");
+}
+bool direct_ok(int t) {
+#if defined(GGML_USE_HIP)
+    (void) t;
+    return false;
+#else
+    // Q8_0, and NVFP4 in w4a4x2 or w4a8 (not w4a4: its unit has no pointer table)
+    if (t == GGML_TYPE_Q8_0) return true;
+    return t == GGML_TYPE_NVFP4 && (x2_mode() || !fp4_activations(t));
+#endif
+}
+bool token_rows_ok(int t, int64_t w_cols) {
+#if defined(GGML_USE_HIP)
+    (void) t; (void) w_cols;
+    return false;
+#else
+    return t == GGML_TYPE_NVFP4 && x2_mode() && w_cols >= kX2MinK;
+#endif
+}
+bool swiglu_quant_ok(int t) {
+    // the q8_1 D4 rows quantize() writes for a down product's H (K 640): Q8_0, and NVFP4 unless w4a4 takes FP4 rows
+    if (t == GGML_TYPE_NVFP4) return fp4_activations(t) ? x2_mode() : true;
+    return mmq_get_q8_1_ds_layout((ggml_type) t) == MMQ_Q8_1_DS_LAYOUT_D4;
+}
+void swiglu_quant(const float* gu, void* hq, int64_t rows, const int32_t* bounds, int n, const float* const* tails,
+                  int64_t row0, float* sd, void* stream) {
+    if (rows <= 0 || n <= 0) return;
+    if (n > kGatherGroupMax) { std::fprintf(stderr, "prefill mmq: swiglu_quant over %d experts\n", n); std::exit(1); }
+    TailPtrs tp{};
+    for (int q = 0; q < n; ++q) tp.p[q] = tails[q];
+    swiglu_quant_kernel<<<dim3((unsigned) rows, 2), 128, 0, (cudaStream_t) stream>>>(gu, (block_q8_1_mmq*) hq, rows, bounds,
+                                                                                      n, tp, row0, sd);
+    ck(cudaGetLastError(), "swiglu_quant");
 }
 void down_row_scales(float* sd, const int32_t* bounds, int n, const float* tails, int64_t nrows, void* stream) {
     if (nrows <= 0 || n <= 0) return;
