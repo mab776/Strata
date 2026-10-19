@@ -22,8 +22,10 @@ bool supported(int ggml_type);
 bool fits(int ggml_type, int64_t w_rows);
 /// NVFP4 prompt precision, STRATA_PREFILL_NVFP4: w4a8 (default) - int8 tensor cores, Q8_1 activations, what decode
 /// runs at; w4a4 - Blackwell's FP4 x FP4 MMA, activations rounded to NVFP4 (faster, first-token KL up to 0.03 vs
-/// fp16); fp16 - the dequantize + FP16 GEMM path (the reference).
-enum class Nvfp4Mode { W4A8, W4A4, FP16 };
+/// fp16); fp16 - the dequantize + FP16 GEMM path (the reference); w4a4x2 - the products with K >= 2048 (gate/up)
+/// on the FP4 MMA with each activation row as two FP4 terms (x ~ q1 + q2, the residual's own NVFP4: W4A8's precision),
+/// the others (down, K 640) as w4a8 (mmq_nvfp4_a44.cu).
+enum class Nvfp4Mode { W4A8, W4A4, FP16, W4A4X2 };
 Nvfp4Mode nvfp4_mode();
 /// Bytes of one expert's gate+up ([2*n_ff, n_embd]) or down ([n_embd, n_ff]) weights in `ggml_type`.
 size_t matrix_bytes(int ggml_type, int64_t rows, int64_t cols);
@@ -31,12 +33,16 @@ size_t matrix_bytes(int ggml_type, int64_t rows, int64_t cols);
 size_t q8_bytes(int64_t rows, int64_t cols);
 
 /// q8_1 activations for MMQ against weights of `ggml_type`: row i of the output is row ids[i] of x (or row i when
-/// ids is null); `x` has `ld` floats per row.
+/// ids is null); `x` has `ld` floats per row.  With `slot` (the inverse map: token t's k-th row is slot[t * k_used +
+/// k], rows = tokens x k_used) each token is quantized once and written to its k_used rows - the same bytes
+/// (STRATA_QUANT_GATHER=1: per row, as before).
 void quantize(const float* x, const int32_t* ids, void* xq, int ggml_type, int64_t cols, int64_t ld, int64_t rows,
-              void* stream, float* yscale = nullptr);
+              void* stream, float* yscale = nullptr, const int32_t* slot = nullptr, int k_used = 0);
 /// NVFP4 on Blackwell in w4a4 mode: the MMQ kernel multiplies FP4 x FP4, so its activations are NVFP4 too, with
 /// one float scale per row that `quantize` writes to `yscale` and the product reads as Product::y_scale.  Decided
-/// by the mode and a device probe of the same compile.
+/// by the mode and a device probe of the same compile.  In w4a4x2 mode true as well (the gate/up input's terms share
+/// one row scale); `quantize` and `Context::run` pick per product by its K: a product with K < 2048 takes q8_1 and
+/// w4a8 (its y_scale ignored).
 bool fp4_activations(int ggml_type);
 /// NVFP4 expert tails: GU rows [row0, row0 + nrows) of a group of `n` experts (absolute `bounds`, n + 1 of them,
 /// on the device) scaled by their expert's {s_gate, s_up, s_down, 0} (`tails`, 4 floats each, on the device): the
@@ -81,7 +87,19 @@ struct Product {
     /// set: expert z's matrix starts at tab->p[z] (w and expert_bytes are not used for addressing).  CUDA only,
     /// and only where `tab_fits` said so.
     const WeightTab* tab = nullptr;
+    /// n device pointers (host array, n <= kGatherGroupMax): expert e's [w_rows, w_cols] matrix where it lies, instead of
+    /// w + e * expert_bytes.  Only where direct_ok.  The K blocks past a row's end are not read (the same sums).
+    const void* const* w_ptrs = nullptr;
+    /// With w_ptrs, a w4a4x2 product (gate/up) only: xq holds y_count activation rows (each token once, quantize
+    /// without ids) and MMQ row r reads row y_rows[r] (device; the prompt path's row -> token table) - the same bytes
+    /// as the rows a scattering quantize writes, without writing each token k_used times.
+    const int32_t* y_rows = nullptr;
+    int64_t y_count = 0;
 };
+/// A Product of this type can take w_ptrs (read its experts in place): Q8_0, NVFP4 in w4a4x2 or w4a8.
+bool direct_ok(int ggml_type);
+/// ...and y_rows, at this K: NVFP4 in w4a4x2 with K >= 2048 (gate/up).
+bool token_rows_ok(int ggml_type, int64_t w_cols);
 
 /// The launch context (llama.cpp's MMQ keeps a small scratch pool for its stream-k fixup).  One per prompt path.
 class Context {
@@ -127,6 +145,12 @@ void swiglu_scaled(const float* gu, float* h, int64_t rows, int64_t n_ff, const 
                    const float* tails, int64_t row0, void* stream);
 /// sd[r] = the s_down of row r's expert (group-local bounds): the combine applies it as it reads the row.
 void down_row_scales(float* sd, const int32_t* bounds, int n, const float* tails, int64_t nrows, void* stream);
+/// swiglu_scaled (n_ff 640), then quantize() of its rows for a down product of `ggml_type`, then down_row_scales into
+/// sd (null: none) - in one pass, H never stored; the same bytes in hq and sd.  Only where swiglu_quant_ok.  tails:
+/// n device pointers (host array, n <= kGatherGroupMax), expert q's {s_gate, s_up, s_down, 0}.
+bool swiglu_quant_ok(int ggml_type);
+void swiglu_quant(const float* gu, void* hq, int64_t rows, const int32_t* bounds, int n, const float* const* tails,
+                  int64_t row0, float* sd, void* stream);
 
 /// dst[i] = i for i < n (the identity row map MMQ's MoE mode writes through).
 void iota(int32_t* dst, int64_t n, void* stream);
