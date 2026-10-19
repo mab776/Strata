@@ -7696,9 +7696,14 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     except ValueError as e:
         print(f"[strata] {e}: set a key, or leave it out", file=sys.stderr)
         return 2
+    # mab776: "lan_without_api_key": true in the config keeps 0.1.x's behaviour (a LAN/VPN-only box whose clients send
+    # no key); the Host-header check (allowed_hosts) still applies.
     if a.host not in ("127.0.0.1", "localhost", "::1") and not preflight_api_key:
-        print("[strata] a non-loopback bind requires an inference API key", file=sys.stderr, flush=True)
-        return 2
+        if cfg.get("lan_without_api_key") is True:
+            print(f"[strata] serving {a.host} without an API key (config lan_without_api_key)", flush=True)
+        else:
+            print("[strata] a non-loopback bind requires an inference API key", file=sys.stderr, flush=True)
+            return 2
     try:                                                # before the minutes of loading: is the port free?
         Server((a.host, a.port), BaseHTTPRequestHandler).server_close()
     except OSError as e:
