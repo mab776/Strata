@@ -76,6 +76,16 @@ namespace kc = strata::dsv41k::cpu;
 namespace gf = strata::dsv41k::glmf;
 namespace gg = strata::ds4::gguf;
 
+// mab776: prompt-lookup drafts (ds4_main.cpp, STRATA_DS4_LOOKUP=N) are verified like DSpark's: the verification's
+// buffers (sampler lists, the ring and compressor backups) are allocated for them even when the drafter is not loaded.
+static bool verify_bufs(int n_mtp) {
+    static const bool lookup = [] {
+        const char* e = std::getenv("STRATA_DS4_LOOKUP");
+        return e != nullptr && std::atoi(e) > 0;
+    }();
+    return n_mtp > 0 || lookup;
+}
+
 #define CK(call)                                                                            \
     do {                                                                                    \
         cudaError_t e_ = (call);                                                            \
@@ -2677,7 +2687,7 @@ struct Model::Impl {
                 !dalloc(d, d.n_groups, 4, err))
                 return false;
             if (g.n_mtp > 0 && !dalloc(d, d.tap, (size_t) tap_cap * D, err)) return false;
-            if (g.n_mtp > 0 && (int) di == head_dev &&
+            if (verify_bufs(g.n_mtp) && (int) di == head_dev &&
                 (!dalloc(d, d_confv, kWin, err) || !dalloc(d, d_ints, 64, err) || !dalloc(d, d_specq, kWin, err)))
                 return false;
             CK(cudaEventCreateWithFlags(&d.ev_out, cudaEventDisableTiming));
@@ -4355,7 +4365,7 @@ struct Model::Impl {
                 }
             }
             if (!dalloc(d, l.win, (size_t) g.win * win_rb(), err, &d.caches)) return false;
-            if (g.n_mtp > 0 && !l.mtp) {
+            if (verify_bufs(g.n_mtp) && !l.mtp) {
                 if (!dalloc(d, l.ring_bak, (size_t) kWin * win_rb(), err)) return false;
                 if (l.kv_src && l.ratio > 1 && (!dalloc(d, l.c_snap, (size_t) 2 * l.ratio * g.hd, err) ||
                                                 !dalloc(d, l.c_rows, (size_t) 2 * kWin * g.hd, err)))
