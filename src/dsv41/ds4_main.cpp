@@ -179,6 +179,32 @@ float dspark_cum_default(const strata::ds4::Model& m) {
                                          strata::ds4::defaults_026());
 }
 
+// mab776: prompt-lookup drafts.  STRATA_DS4_LOOKUP=N (0 = off, at most kWin - 1 = 15): a round without DSpark drafts
+// verifies the tokens that followed the latest earlier match of the last 3 tokens (prompt or answer so far) - code an
+// agent copies back from its prompt.  The output is the model's own: verify keeps a draft with the model's probability.
+int lookup_max() {
+    static const int v = [] {
+        const char* e = std::getenv("STRATA_DS4_LOOKUP");
+        return e != nullptr ? std::max(0, std::min(15, std::atoi(e))) : 0;
+    }();
+    return v;
+}
+
+void lookup_drafts(const std::vector<int32_t>& h, int tok, int n_max, std::vector<int>& d) {
+    constexpr int K = 3;
+    d.clear();
+    const int64_t n = (int64_t) h.size() + 1;   // the history with tok at its end
+    if (n_max <= 0 || n <= K) return;
+    auto at = [&](int64_t i) { return i == n - 1 ? tok : (int) h[(size_t) i]; };
+    for (int64_t s = n - K - 1; s >= 0; --s) {
+        bool eq = true;
+        for (int j = 0; j < K && eq; ++j) eq = at(s + j) == at(n - K + j);
+        if (!eq) continue;
+        for (int64_t i = s + K; i < n && (int) d.size() < n_max; ++i) d.push_back(at(i));
+        return;
+    }
+}
+
 // One round of decoding after `tok` (the token at pos(), not fed yet): with the drafter, its drafts while their
 // confidence holds (at most `room` - 1 of them), verified together; else a plain step.  `out` gets the tokens that follow
 // tok (the accepted drafts, then the trunk's next), the last of them the next round's tok.
@@ -265,6 +291,20 @@ bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, 
     }
     const double rt2 = rt_now();
     const unsigned long long rs2 = rt_seq();
+    if (const int lk = std::min(lookup_max(), room - 1); lk > 0) {   // mab776: prompt-lookup drafts (above)
+        std::vector<int> d;
+        lookup_drafts(m.tokens(), tok, lk, d);
+        if (!d.empty()) {
+            int acc = 0, next = -1;
+            if (!m.verify(tok, d, temperature, top_p, top_k, min_p, seed, counter, acc, next, err)) return false;
+            counter += (unsigned long long) acc + 1;
+            for (int i = 0; i < acc; ++i) out.push_back(d[(size_t) i]);
+            out.push_back(next);
+            offered = (int) d.size();
+            accepted = acc;
+            return true;
+        }
+    }
     if (!m.step(tok, true, err)) return false;
     out.push_back(m.sample(temperature, top_p, top_k, min_p, seed, counter++));
     g_rt.step += rt_now() - rt2;
